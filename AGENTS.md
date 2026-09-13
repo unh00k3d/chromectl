@@ -5,14 +5,16 @@ A single CLI that drives Chrome over the DevTools Protocol. **This file is the c
 ## Launch & manage Chrome instances
 
 ```bash
-chromectl start                       # headless instance on 9222 (name chrome-9222)
+chromectl start                       # instance on 9222; profile persists at ~/.chromectl/profiles/chrome-9222
 chromectl start --name work --auto-port   # a second instance on a free port, named 'work'
+chromectl start --name work           # start 'work' again later -> SAME profile, logins persist
 chromectl start --copy-profile        # launch with a COPY of your real profile (logins)
-chromectl instances                   # list managed instances + up/down status (--json, --prune)
-chromectl stop work                   # stop by name (or port); chromectl stop --all
+chromectl start --ephemeral           # throwaway /tmp profile (no persistence)
+chromectl instances                   # list managed instances + up/down (--json, --prune)
+chromectl stop work                   # stop by name/port; stop --all; stop work --purge (delete profile)
 ```
 
-Target a specific instance with **`-i NAME`** (or `--port N`) before the subcommand:
+Profiles **persist by default** per name — cookies/logins survive restarts. Target an instance with **`-i NAME`** (or `--port N`) before the subcommand:
 
 ```bash
 chromectl -i work open https://site && chromectl -i work read --json
@@ -20,25 +22,23 @@ chromectl -i work open https://site && chromectl -i work read --json
 
 ## Prefer `run` for multi-step tasks
 
-A sequence in one `run` executes in a single process over one persistent connection; state persists across steps and the tab you `open` becomes the implicit target for later steps.
+A sequence in one `run` executes in a single process over one persistent connection; state persists across steps and the tab you `open` becomes the implicit target for later steps. **Note:** step lines are shlex-split, so escape inner quotes in JS (e.g. `eval "localStorage.getItem('k')"` as a standalone command is easier than inside a step).
 
 ```bash
 chromectl -i work run --step 'open https://site/login' \
   --step 'wait --selector #user' \
   --step 'fill-form --set #user=ada --set #pass=secret --submit #go' \
   --step 'wait --url /dashboard' --step 'read --json'
-# or: chromectl run steps.txt   (one command per line)   or pipe via stdin
 ```
 
 ## Conventions (apply everywhere)
 
-- **instance**: `-i NAME` / `--port N` selects which browser. `chromectl instances` lists them.
-- **target** (a tab): id-prefix, url/title substring, `browser`, or empty = first page. In `run`, omit to use the current tab. Prefer `list --json` + id-prefix (titles/URLs change on redirect).
+- **instance**: `-i NAME` / `--port N` selects which browser. `chromectl instances` lists them. Profiles persist per name.
+- **target** (a tab): id-prefix, url/title substring, `browser`, or empty = first page. In `run`, omit to use the current tab. Prefer `list --json` + id-prefix.
 - **`--json`** on read-only commands (`list`,`read`,`extract`,`links`,`cookies`,`seo`,`wait`,`fill-form`,`instances`,`cheat`) → plain pipeable JSON.
-- Put **options after positionals** (e.g. `fill t2 "hello" --selector "#q"`).
-- **Locate elements** (click/fill/hover/wait): `--selector`, `--text`, `--role`+`--name`, or `--ref N` (from last `snapshot`, saved to `.chromectl-snap.json`).
+- Put **options after positionals**. Locate elements (click/fill/hover/wait) by `--selector`, `--text`, `--role`+`--name`, or `--ref N` (from last `snapshot`).
 - **Emulation** (`emulate`/`resize`) reverts on exit — use `--shot`, `--hold`, or an `emulate` step in a `run`.
-- Non-zero exit on failure. `run` stops at first failure unless `--keep-going`. `lighthouse` needs `npm i -g lighthouse`.
+- Non-zero exit on failure. `lighthouse` needs `npm i -g lighthouse`.
 
 
 ## All commands
@@ -46,9 +46,9 @@ chromectl -i work run --step 'open https://site/login' \
 | command | usage | what |
 |---|---|---|
 | `list (ls)` | `--json` | list open targets (tabs) |
-| `start` | `--name NAME --auto-port --profile PROFILE --headful --binary BINARY --copy-profile --from-profile PATH` | launch a Chrome instance (headless by default) |
+| `start` | `--name NAME --auto-port --profile PROFILE --ephemeral --headful --binary BINARY --copy-profile --from-profile PATH` | launch a Chrome instance (headless by default) |
 | `instances (ps)` | `--json --prune` | list managed Chrome instances and their status |
-| `stop` | `[which] --all` | stop a managed instance (by name/port) or --all |
+| `stop` | `[which] --all --purge` | stop a managed instance (by name/port) or --all |
 | `version` | `` | browser + protocol version |
 | `cheat (commands)` | `--json` | print the entire command surface in one call (agent-friendly) |
 | `open` | `<url>` | open a new tab at URL |

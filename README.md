@@ -24,9 +24,10 @@ libs are imported lazily, so the core commands stay fast.
 ## 1. Launch Chrome
 
 ```bash
-chromectl start                                   # headless, port 9222, throwaway profile
+chromectl start                                   # headless, port 9222, PERSISTENT profile
 chromectl start --headful --port 9223             # visible window, custom port
 chromectl start --profile ~/.cache/chromectl      # custom profile dir
+chromectl start --ephemeral                       # throwaway profile in /tmp (no persistence)
 chromectl start --copy-profile                    # copy your REAL Chrome profile (logins!) then launch
 chromectl start --from-profile /path/to/profile   # copy from a specific profile dir
 ```
@@ -56,8 +57,12 @@ chromectl stop --all                        # stop every managed instance
 at `~/.chromectl/instances.json`.
 
 Notes:
+- **Profiles persist by default.** Each instance gets a stable dir at
+  `~/.chromectl/profiles/<name>` that's **reused every time you start that name**, so
+  cookies/logins survive restarts. Use `--profile PATH` for a custom location,
+  `--ephemeral` for a throwaway `/tmp` profile, or `stop <name> --purge` to delete it.
 - A **non-default profile is mandatory** since Chrome 136 — the real default profile
-  refuses the debug port (anti-cookie-theft). `start` uses a throwaway profile; to reuse
+  refuses the debug port (anti-cookie-theft). `start`'s profile is non-default; to reuse
   your logins, copy your real one first: `cp -r ~/.config/google-chrome /tmp/prof` then
   `chromectl start --profile /tmp/prof`.
 - `start` sets `--remote-allow-origins=*` so clients (incl. Playwright) can connect.

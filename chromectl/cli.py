@@ -419,7 +419,16 @@ def cmd_start(a):
         err.print("no Chrome/Chromium found on PATH — pass --binary /path/to/chrome")
         sys.exit(1)
     port = _free_port(a.host) if a.auto_port else a.port
-    profile = a.profile or f"/tmp/chromectl-profile-{port}"
+    label = a.name or f"chrome-{port}"
+    existing = _find_instance(label)
+    if a.profile:                                  # explicit dir wins
+        profile = os.path.expanduser(a.profile)
+    elif a.ephemeral:                              # throwaway, fresh each run
+        profile = f"/tmp/chromectl-profile-{port}"
+    elif existing and existing.get("profile"):     # reuse this instance's previous dir
+        profile = existing["profile"]
+    else:                                          # stable, persistent per name (logins survive restarts)
+        profile = os.path.expanduser(os.path.join("~", ".chromectl", "profiles", label))
 
     if a.copy_profile or a.from_profile:
         src = a.from_profile or _default_profile_dir()
@@ -524,7 +533,14 @@ def cmd_stop(a):
                 err.print(f"{t.get('name')}: {e}")
         if not ok or pid is None:
             os.system(f'pkill -f "remote-debugging-port={port}" 2>/dev/null')
-        console.print(f"[green]stopped[/green] {t.get('name','?')} [dim](port {port})[/dim]")
+        msg = f"[green]stopped[/green] {t.get('name','?')} [dim](port {port})[/dim]"
+        if a.purge and t.get("profile"):
+            import shutil
+            import time as _t
+            _t.sleep(0.3)                      # let Chrome release the profile
+            shutil.rmtree(t["profile"], ignore_errors=True)
+            msg += f"  [yellow]purged[/yellow] {t['profile']}"
+        console.print(msg)
         stopped_keys.add((host, port))
     remaining = [i for i in items if (i.get("host", "localhost"), i.get("port")) not in stopped_keys]
     _save_instances(remaining)
@@ -2030,7 +2046,9 @@ def build_parser():
     sp = sub.add_parser("start", help="launch a Chrome instance (headless by default)")
     sp.add_argument("--name", help="label this instance (target later with -i NAME)")
     sp.add_argument("--auto-port", action="store_true", help="pick a free port instead of --port")
-    sp.add_argument("--profile", help="user-data-dir (default /tmp/chromectl-profile-<port>)")
+    sp.add_argument("--profile", help="user-data-dir (default: persistent ~/.chromectl/profiles/<name>)")
+    sp.add_argument("--ephemeral", action="store_true",
+                    help="use a throwaway profile in /tmp (no persistence) instead of the default")
     sp.add_argument("--headful", action="store_true", help="show the window")
     sp.add_argument("--binary", help="path to a Chrome/Chromium binary")
     sp.add_argument("--copy-profile", action="store_true",
@@ -2047,6 +2065,7 @@ def build_parser():
     sp = sub.add_parser("stop", help="stop a managed instance (by name/port) or --all")
     sp.add_argument("which", nargs="?", help="instance name or port")
     sp.add_argument("--all", action="store_true", help="stop every managed instance")
+    sp.add_argument("--purge", action="store_true", help="also delete the instance's profile dir")
     sp.set_defaults(fn=cmd_stop)
 
     sp = sub.add_parser("version", help="browser + protocol version"); sp.set_defaults(fn=cmd_version)
