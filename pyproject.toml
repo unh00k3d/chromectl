@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,9 +8,25 @@ version = "0.1.0"
 description = "A friendly CLI for driving Chrome over the DevTools Protocol — for agents and humans."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [{ name = "chromectl" }]
-keywords = ["chrome", "cdp", "devtools", "automation", "agent", "cli", "playwright"]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "unh00k3d" }]
+keywords = ["chrome", "chromium", "cdp", "devtools", "automation", "agent", "cli", "playwright", "lighthouse", "headless"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Utilities",
+]
 dependencies = [
     "websocket-client>=1.7",
     "rich>=13",
@@ -22,7 +38,12 @@ dependencies = [
 
 [project.optional-dependencies]
 # `lighthouse` command also needs the Node CLI:  npm i -g lighthouse
-dev = ["build", "pipx"]
+dev = ["build", "twine", "pipx"]
+
+[project.urls]
+Homepage = "https://github.com/unh00k3d/chromectl"
+Repository = "https://github.com/unh00k3d/chromectl"
+Issues = "https://github.com/unh00k3d/chromectl/issues"
 
 [project.scripts]
 chromectl = "chromectl.cli:main"

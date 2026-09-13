@@ -9,10 +9,16 @@ Core Web Vitals / Lighthouse, and a raw escape hatch.
 ## Install
 
 ```bash
-pipx install git+https://github.com/unh00k3d/chromectl.git   # install straight from the repo
-# or, from a local clone:  pipx install .
-pipx upgrade chromectl                                    # pull later changes
+pipx install chromectl                                    # from PyPI
+pipx upgrade chromectl                                    # pull later releases
 npm i -g lighthouse                                       # optional — only for `lighthouse`
+```
+
+Bleeding edge, straight from the repo:
+
+```bash
+pipx install git+https://github.com/unh00k3d/chromectl.git
+# or, from a local clone:  pipx install .
 ```
 
 pipx puts `chromectl` on your PATH in an isolated env and pulls all Python deps
