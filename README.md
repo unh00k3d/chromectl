@@ -37,6 +37,24 @@ logins** without touching/using the original profile. Close Chrome using that pr
 so its files aren't mid-write. Security: the copy holds your live cookies/sessions — anyone
 who reaches the debug port can act as you, so keep it local and delete it when done.
 
+### Multiple instances
+Run and manage several browsers at once, each on its own port, addressed by name:
+
+```bash
+chromectl start --name work                 # instance on 9222
+chromectl start --name scratch --auto-port  # a second, on the next free port
+chromectl instances                         # list them + up/down status (--json, --prune)
+
+chromectl -i scratch open https://example.com   # target by name (or --port 9223)
+chromectl -i work read --json
+
+chromectl stop scratch                      # stop one by name/port
+chromectl stop --all                        # stop every managed instance
+```
+
+`-i NAME` (or `--port N`) selects which browser every command talks to. The registry lives
+at `~/.chromectl/instances.json`.
+
 Notes:
 - A **non-default profile is mandatory** since Chrome 136 — the real default profile
   refuses the debug port (anti-cookie-theft). `start` uses a throwaway profile; to reuse

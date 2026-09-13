@@ -363,6 +363,54 @@ def _default_profile_dir():
     return os.path.join(home, ".config", "google-chrome")
 
 
+# --- instance registry (managed Chrome processes) ---
+STATE_FILE = os.path.expanduser("~/.chromectl/instances.json")
+
+
+def _load_instances():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _save_instances(items):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump(items, f, indent=2)
+
+
+def _port_alive(host, port):
+    try:
+        _http(host, port, "/json/version")
+        return True
+    except Exception:
+        return False
+
+
+def _free_port(host, start=9222, span=200):
+    import socket
+    bind_host = "127.0.0.1" if host in ("localhost", "127.0.0.1", "") else host
+    for p in range(start, start + span):
+        with socket.socket() as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((bind_host, p))
+                return p
+            except OSError:
+                continue
+    raise CDPError(f"no free port in {start}..{start + span}")
+
+
+def _find_instance(sel):
+    """Resolve a name or port string to a registry entry (or None)."""
+    for i in _load_instances():
+        if i.get("name") == sel or str(i.get("port")) == str(sel):
+            return i
+    return None
+
+
 def cmd_start(a):
     import shutil
     import subprocess
@@ -370,7 +418,8 @@ def cmd_start(a):
     if not binary:
         err.print("no Chrome/Chromium found on PATH — pass --binary /path/to/chrome")
         sys.exit(1)
-    profile = a.profile or "/tmp/chromectl-profile"
+    port = _free_port(a.host) if a.auto_port else a.port
+    profile = a.profile or f"/tmp/chromectl-profile-{port}"
 
     if a.copy_profile or a.from_profile:
         src = a.from_profile or _default_profile_dir()
@@ -392,29 +441,93 @@ def cmd_start(a):
             sys.exit(1)
         console.print("[yellow]note:[/yellow] this profile carries your real cookies/logins — "
                       "anyone who reaches the debug port can act as you. Keep it local; delete when done.")
-    argv = [binary, f"--remote-debugging-port={a.port}", f"--user-data-dir={profile}",
+    argv = [binary, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
             "--no-first-run", "--no-default-browser-check", "--remote-allow-origins=*"]
     if not a.headful:
         argv.insert(1, "--headless=new")
-    # already running?
-    try:
-        _http(a.host, a.port, "/json/version")
-        console.print(f"[yellow]already running[/yellow] on {a.host}:{a.port}")
-        return
-    except Exception:
-        pass
-    subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+    if _port_alive(a.host, port):
+        err.print(f"port {port} already has a live Chrome — pick another --port or use --auto-port")
+        sys.exit(1)
+    proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
     for _ in range(40):
-        try:
-            v = _http(a.host, a.port, "/json/version")
-            console.print(f"[green]Chrome up[/green] on {a.host}:{a.port}  "
-                          f"[dim]({v.get('Browser','?')}, profile {profile})[/dim]")
+        if _port_alive(a.host, port):
+            name = a.name or f"chrome-{port}"
+            inst = {"name": name, "host": a.host, "port": port, "pid": proc.pid,
+                    "profile": profile, "headful": bool(a.headful), "binary": binary,
+                    "created": time.strftime("%Y-%m-%d %H:%M:%S")}
+            items = [i for i in _load_instances()
+                     if not (i.get("port") == port and i.get("host") == a.host) and i.get("name") != name]
+            items.append(inst)
+            _save_instances(items)
+            v = _http(a.host, port, "/json/version")
+            console.print(f"[green]Chrome up[/green] [bold]{name}[/bold] on {a.host}:{port}  "
+                          f"[dim]({v.get('Browser','?')}, pid {proc.pid}, profile {profile})[/dim]")
+            console.print(f"[dim]target it with:  chromectl -i {name} <cmd>   (or --port {port})[/dim]")
             return
-        except Exception:
-            time.sleep(0.3)
+        time.sleep(0.3)
     err.print("Chrome did not come up in time (try --headful to see errors)")
     sys.exit(1)
+
+
+def cmd_instances(a):
+    items = _load_instances()
+    for i in items:
+        i["up"] = _port_alive(i.get("host", "localhost"), i.get("port"))
+    if a.prune:
+        items = [i for i in items if i["up"]]
+        _save_instances([{k: v for k, v in i.items() if k != "up"} for i in items])
+    if a.json:
+        out_json(items)
+        return
+    if not items:
+        console.print("[dim]no managed instances (start one: chromectl start)[/dim]")
+        return
+    tbl = Table(header_style="bold cyan", title="chromectl instances")
+    for col in ("name", "status", "host:port", "pid", "profile", "started"):
+        tbl.add_column(col)
+    for i in items:
+        status = "[green]up[/green]" if i["up"] else "[red]down[/red]"
+        tbl.add_row(i.get("name", "?"), status, f"{i.get('host')}:{i.get('port')}",
+                    str(i.get("pid", "-")), (i.get("profile", "") or "")[-32:], i.get("created", ""))
+    console.print(tbl)
+
+
+def cmd_stop(a):
+    import signal
+    items = _load_instances()
+    if a.all:
+        targets = list(items)
+    else:
+        if not a.which:
+            err.print("say which: a name, a port, or --all")
+            sys.exit(1)
+        hit = _find_instance(a.which)
+        if hit:
+            targets = [hit]
+        elif str(a.which).isdigit():          # a bare port not in the registry
+            targets = [{"name": a.which, "host": a.host, "port": int(a.which), "pid": None}]
+        else:
+            err.print(f"no instance named/port {a.which!r} (see: chromectl instances)")
+            sys.exit(1)
+    stopped_keys = set()
+    for t in targets:
+        pid, port, host = t.get("pid"), t.get("port"), t.get("host", "localhost")
+        ok = False
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                ok = True
+            except ProcessLookupError:
+                ok = True                      # already gone
+            except Exception as e:
+                err.print(f"{t.get('name')}: {e}")
+        if not ok or pid is None:
+            os.system(f'pkill -f "remote-debugging-port={port}" 2>/dev/null')
+        console.print(f"[green]stopped[/green] {t.get('name','?')} [dim](port {port})[/dim]")
+        stopped_keys.add((host, port))
+    remaining = [i for i in items if (i.get("host", "localhost"), i.get("port")) not in stopped_keys]
+    _save_instances(remaining)
 
 
 def cmd_version(a):
@@ -1901,6 +2014,8 @@ def build_parser():
         epilog=__doc__.split("Quick start:")[1] if "Quick start:" in __doc__ else "")
     p.add_argument("--host", default=os.environ.get("CDP_HOST", "localhost"))
     p.add_argument("--port", type=int, default=int(os.environ.get("CDP_PORT", "9222")))
+    p.add_argument("-i", "--instance", metavar="NAME",
+                   help="target a managed instance by name/port (from `chromectl instances`)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     jsonopt = argparse.ArgumentParser(add_help=False)
@@ -1912,8 +2027,10 @@ def build_parser():
 
     sp = sub.add_parser("list", aliases=["ls"], parents=[jsonopt], help="list open targets (tabs)")
     sp.set_defaults(fn=cmd_list)
-    sp = sub.add_parser("start", help="launch Chrome with the debug port (headless by default)")
-    sp.add_argument("--profile", help="user-data-dir (default /tmp/chromectl-profile)")
+    sp = sub.add_parser("start", help="launch a Chrome instance (headless by default)")
+    sp.add_argument("--name", help="label this instance (target later with -i NAME)")
+    sp.add_argument("--auto-port", action="store_true", help="pick a free port instead of --port")
+    sp.add_argument("--profile", help="user-data-dir (default /tmp/chromectl-profile-<port>)")
     sp.add_argument("--headful", action="store_true", help="show the window")
     sp.add_argument("--binary", help="path to a Chrome/Chromium binary")
     sp.add_argument("--copy-profile", action="store_true",
@@ -1921,6 +2038,16 @@ def build_parser():
     sp.add_argument("--from-profile", metavar="PATH",
                     help="copy from this profile dir instead of auto-detecting")
     sp.set_defaults(fn=cmd_start)
+
+    sp = sub.add_parser("instances", aliases=["ps"], parents=[jsonopt],
+                        help="list managed Chrome instances and their status")
+    sp.add_argument("--prune", action="store_true", help="forget instances that are no longer up")
+    sp.set_defaults(fn=cmd_instances)
+
+    sp = sub.add_parser("stop", help="stop a managed instance (by name/port) or --all")
+    sp.add_argument("which", nargs="?", help="instance name or port")
+    sp.add_argument("--all", action="store_true", help="stop every managed instance")
+    sp.set_defaults(fn=cmd_stop)
 
     sp = sub.add_parser("version", help="browser + protocol version"); sp.set_defaults(fn=cmd_version)
 
@@ -2130,6 +2257,12 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    if getattr(args, "instance", None):        # -i NAME → that instance's host/port
+        inst = _find_instance(args.instance)
+        if not inst:
+            err.print(f"no managed instance {args.instance!r} (see: chromectl instances)")
+            sys.exit(1)
+        args.host, args.port = inst.get("host", args.host), inst.get("port", args.port)
     if args.cmd == "capture" and not args.url and not args.attach:
         err.print("capture needs a URL or --attach TARGET")
         sys.exit(1)
