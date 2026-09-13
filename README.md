@@ -9,7 +9,7 @@ Core Web Vitals / Lighthouse, and a raw escape hatch.
 ## Install
 
 ```bash
-pipx install git+https://github.com/USER/chromectl.git   # install straight from the repo
+pipx install git+https://github.com/unh00k3d/chromectl.git   # install straight from the repo
 # or, from a local clone:  pipx install .
 pipx upgrade chromectl                                    # pull later changes
 npm i -g lighthouse                                       # optional — only for `lighthouse`
