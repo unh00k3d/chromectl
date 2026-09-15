@@ -411,6 +411,131 @@ def _find_instance(sel):
     return None
 
 
+# --- chrome flags: user-supplied extras + proxy ---
+def _switch_name(flag):
+    return flag.split("=", 1)[0]
+
+
+def _switch_value(flags, name):
+    for f in flags:
+        if _switch_name(f) == name:
+            return f.split("=", 1)[1] if "=" in f else ""
+    return None
+
+
+def _merge_chrome_flags(base, extra):
+    """Fold user flags into ours. Same switch twice = the user's value wins, in place."""
+    out = list(base)
+    for arg in extra:
+        for idx, cur in enumerate(out):
+            if _switch_name(cur) == _switch_name(arg):
+                out[idx] = arg
+                break
+        else:
+            out.append(arg)
+    return out
+
+
+def _extra_chrome_args(a):
+    """--chrome-arg X (repeatable) plus anything after a bare `--`."""
+    extra = []
+    for arg in (a.chrome_arg or []):
+        extra.append(arg if arg.startswith("-") else "--" + arg)
+    for arg in (a.chrome_args or []):
+        if not arg.startswith("-"):
+            err.print(f"stray argument {arg!r} after `--` — Chrome flags start with a dash")
+            sys.exit(1)
+        extra.append(arg)
+    return extra
+
+
+def _proxy_plan(a):
+    """Validate the proxy options up front.
+
+    Returns (chrome_flags, upstream_needing_auth_or_None, registry_fields).
+    Chrome takes a proxy but never credentials — it opens a login dialog, which
+    is no use headless — so a proxy with a username/password gets a local relay
+    (see `_start_relay`) that adds them on the way upstream.
+    """
+    from . import proxyrelay
+    flags, info = [], {}
+    if a.proxy and a.proxy_pac:
+        err.print("--proxy and --proxy-pac are two ways to pick a proxy — keep one")
+        sys.exit(1)
+    if a.proxy_auth and not a.proxy:
+        err.print("--proxy-auth needs a --proxy to authenticate against")
+        sys.exit(1)
+    if a.proxy_pac:
+        flags.append(f"--proxy-pac-url={a.proxy_pac}")
+        info["proxy"] = f"pac:{a.proxy_pac}"
+    if a.proxy_bypass:
+        flags.append(f"--proxy-bypass-list={a.proxy_bypass}")
+    if not a.proxy:
+        return flags, None, info
+
+    user = password = None
+    if a.proxy_auth:
+        user, _, password = a.proxy_auth.partition(":")
+    try:
+        up = proxyrelay.parse_proxy(a.proxy, user, password)
+    except ValueError as e:
+        err.print(str(e))
+        sys.exit(1)
+    info["proxy"] = proxyrelay.proxy_str(up)
+    if not up["user"]:                              # no credentials: Chrome can do it alone
+        flags.append(f"--proxy-server={up['scheme']}://{up['host']}:{up['port']}")
+        return flags, None, info
+    if up["scheme"] == "socks4":
+        err.print("SOCKS4 has no password auth — use socks5:// or an http:// proxy")
+        sys.exit(1)
+    return flags, up, info
+
+
+def _start_relay(up, info, port_hint):
+    """Run the authenticating relay for `up`; returns the Chrome flag pointing at it."""
+    import socket as _socket
+    import subprocess
+    relay_port = _free_port("127.0.0.1", start=max(port_hint + 1000, 9500))
+    # credentials go through the environment, never argv — argv is world-readable in `ps`
+    env = dict(os.environ, CHROMECTL_PROXY_USER=up["user"],
+               CHROMECTL_PROXY_PASSWORD=up["password"] or "")
+    relay = subprocess.Popen(
+        [sys.executable, "-m", "chromectl.proxyrelay", "--listen", str(relay_port),
+         "--upstream", f"{up['scheme']}://{up['host']}:{up['port']}"],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(30):
+        if relay.poll() is not None:
+            err.print("proxy relay exited immediately — check the --proxy URL")
+            sys.exit(1)
+        try:
+            with _socket.create_connection(("127.0.0.1", relay_port), 0.3):
+                break
+        except OSError:
+            time.sleep(0.1)
+    else:
+        relay.kill()
+        err.print(f"proxy relay did not come up on 127.0.0.1:{relay_port}")
+        sys.exit(1)
+    console.print(f"[cyan]proxy[/cyan] {info['proxy']} "
+                  f"[dim](authenticating relay on 127.0.0.1:{relay_port}, pid {relay.pid})[/dim]")
+    info["relay_pid"], info["relay_port"] = relay.pid, relay_port
+    return f"--proxy-server=http://127.0.0.1:{relay_port}"
+
+
+def _kill_relay(inst):
+    """Stop the authenticating relay (if any) that belongs to an instance."""
+    import signal
+    pid = inst.get("relay_pid")
+    if not pid:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception as e:
+        err.print(f"relay pid {pid}: {e}")
+
+
 def cmd_start(a):
     import shutil
     import subprocess
@@ -418,6 +543,7 @@ def cmd_start(a):
     if not binary:
         err.print("no Chrome/Chromium found on PATH — pass --binary /path/to/chrome")
         sys.exit(1)
+    proxy_flags, needs_auth, proxy_info = _proxy_plan(a)   # fail on a bad proxy before anything runs
     port = _free_port(a.host) if a.auto_port else a.port
     label = a.name or f"chrome-{port}"
     existing = _find_instance(label)
@@ -450,13 +576,24 @@ def cmd_start(a):
             sys.exit(1)
         console.print("[yellow]note:[/yellow] this profile carries your real cookies/logins — "
                       "anyone who reaches the debug port can act as you. Keep it local; delete when done.")
-    argv = [binary, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
-            "--no-first-run", "--no-default-browser-check", "--remote-allow-origins=*"]
+    flags = [f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
+             "--no-first-run", "--no-default-browser-check", "--remote-allow-origins=*"]
     if not a.headful:
-        argv.insert(1, "--headless=new")
+        flags.insert(0, "--headless=new")
+    extra = _extra_chrome_args(a)
+    if a.proxy and any(_switch_name(f) == "--proxy-server" for f in extra):
+        err.print("--proxy and a hand-passed --proxy-server do the same job — keep one")
+        sys.exit(1)
+    flags = _merge_chrome_flags(flags, extra)          # user flags override ours
+    port = int(_switch_value(flags, "--remote-debugging-port") or port)
+    profile = _switch_value(flags, "--user-data-dir") or profile
     if _port_alive(a.host, port):
         err.print(f"port {port} already has a live Chrome — pick another --port or use --auto-port")
         sys.exit(1)
+    if needs_auth:
+        proxy_flags.append(_start_relay(needs_auth, proxy_info, port))
+    flags = _merge_chrome_flags(flags, proxy_flags)
+    argv = [binary] + flags
     proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True)
     for _ in range(40):
@@ -464,9 +601,18 @@ def cmd_start(a):
             name = a.name or f"chrome-{port}"
             inst = {"name": name, "host": a.host, "port": port, "pid": proc.pid,
                     "profile": profile, "headful": bool(a.headful), "binary": binary,
-                    "created": time.strftime("%Y-%m-%d %H:%M:%S")}
-            items = [i for i in _load_instances()
-                     if not (i.get("port") == port and i.get("host") == a.host) and i.get("name") != name]
+                    "created": time.strftime("%Y-%m-%d %H:%M:%S"), **proxy_info}
+            if extra:
+                inst["chrome_args"] = extra
+            stale = [i for i in _load_instances()
+                     if (i.get("port") == port and i.get("host") == a.host) or i.get("name") == name]
+            for i in stale:
+                # reap a previous run's relay, but never one whose browser is still up
+                # on another port — that browser still needs it to reach the network
+                same_slot = i.get("port") == port and i.get("host") == a.host
+                if same_slot or not _port_alive(i.get("host", "localhost"), i.get("port")):
+                    _kill_relay(i)
+            items = [i for i in _load_instances() if i not in stale]
             items.append(inst)
             _save_instances(items)
             v = _http(a.host, port, "/json/version")
@@ -475,6 +621,7 @@ def cmd_start(a):
             console.print(f"[dim]target it with:  chromectl -i {name} <cmd>   (or --port {port})[/dim]")
             return
         time.sleep(0.3)
+    _kill_relay(proxy_info)
     err.print("Chrome did not come up in time (try --headful to see errors)")
     sys.exit(1)
 
@@ -484,6 +631,9 @@ def cmd_instances(a):
     for i in items:
         i["up"] = _port_alive(i.get("host", "localhost"), i.get("port"))
     if a.prune:
+        for i in items:
+            if not i["up"]:
+                _kill_relay(i)
         items = [i for i in items if i["up"]]
         _save_instances([{k: v for k, v in i.items() if k != "up"} for i in items])
     if a.json:
@@ -493,12 +643,20 @@ def cmd_instances(a):
         console.print("[dim]no managed instances (start one: chromectl start)[/dim]")
         return
     tbl = Table(header_style="bold cyan", title="chromectl instances")
-    for col in ("name", "status", "host:port", "pid", "profile", "started"):
+    cols = ["name", "status", "host:port", "pid", "profile", "started"]
+    show_proxy = any(i.get("proxy") for i in items)
+    if show_proxy:
+        cols.insert(5, "proxy")
+    for col in cols:
         tbl.add_column(col)
     for i in items:
         status = "[green]up[/green]" if i["up"] else "[red]down[/red]"
-        tbl.add_row(i.get("name", "?"), status, f"{i.get('host')}:{i.get('port')}",
-                    str(i.get("pid", "-")), (i.get("profile", "") or "")[-32:], i.get("created", ""))
+        row = [i.get("name", "?"), status, f"{i.get('host')}:{i.get('port')}",
+               str(i.get("pid", "-")), (i.get("profile", "") or "")[-32:]]
+        if show_proxy:
+            row.append(i.get("proxy", "-"))
+        row.append(i.get("created", ""))
+        tbl.add_row(*row)
     console.print(tbl)
 
 
@@ -533,6 +691,7 @@ def cmd_stop(a):
                 err.print(f"{t.get('name')}: {e}")
         if not ok or pid is None:
             os.system(f'pkill -f "remote-debugging-port={port}" 2>/dev/null')
+        _kill_relay(t)
         msg = f"[green]stopped[/green] {t.get('name','?')} [dim](port {port})[/dim]"
         if a.purge and t.get("profile"):
             import shutil
@@ -2055,6 +2214,18 @@ def build_parser():
                     help="copy your real Chrome profile (logins/cookies) into --profile first")
     sp.add_argument("--from-profile", metavar="PATH",
                     help="copy from this profile dir instead of auto-detecting")
+    sp.add_argument("--proxy", metavar="URL",
+                    help="proxy for this instance: [scheme://][user:pass@]host:port "
+                         "(http, https, socks4, socks5; default scheme http)")
+    sp.add_argument("--proxy-auth", metavar="USER:PASS",
+                    help="proxy credentials, instead of putting them in --proxy")
+    sp.add_argument("--proxy-bypass", metavar="LIST",
+                    help="hosts that skip the proxy, e.g. 'localhost,*.internal'")
+    sp.add_argument("--proxy-pac", metavar="URL", help="use a PAC file instead of --proxy")
+    sp.add_argument("--chrome-arg", action="append", metavar="FLAG",
+                    help="extra Chrome flag, repeatable (also: put them after a bare `--`)")
+    sp.add_argument("chrome_args", nargs="*", metavar="FLAG",
+                    help="anything after a bare `--` is passed straight to Chrome")
     sp.set_defaults(fn=cmd_start)
 
     sp = sub.add_parser("instances", aliases=["ps"], parents=[jsonopt],

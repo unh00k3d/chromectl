@@ -36,7 +36,48 @@ chromectl start --profile ~/.cache/chromectl      # custom profile dir
 chromectl start --ephemeral                       # throwaway profile in /tmp (no persistence)
 chromectl start --copy-profile                    # copy your REAL Chrome profile (logins!) then launch
 chromectl start --from-profile /path/to/profile   # copy from a specific profile dir
+chromectl start --proxy user:pass@10.0.0.1:8080   # behind a proxy (credentials handled)
+chromectl start -- --lang=tr --disable-gpu        # pass any extra Chrome flags
 ```
+
+### Extra Chrome flags
+
+Anything after a bare `--` goes straight to Chrome, or pass them one at a time with
+`--chrome-arg` (write `--chrome-arg=--flag` when the value starts with a dash):
+
+```bash
+chromectl start --name tr -- --lang=tr --window-size=1280,800 --host-resolver-rules='MAP * 1.2.3.4'
+chromectl start --chrome-arg=--disable-dev-shm-usage --chrome-arg=--blink-settings=imagesEnabled=false
+```
+
+Your flags **override** the ones chromectl sets, so `-- --headless=old` or
+`-- --user-data-dir=/tmp/p` win — and the registry records the values Chrome actually got.
+`instances --json` lists them under `chrome_args`.
+
+### Proxies
+
+```bash
+chromectl start --proxy 10.0.0.1:8080                        # http proxy (default scheme)
+chromectl start --proxy socks5://10.0.0.1:1080               # socks5 (also https://, socks4://)
+chromectl start --proxy socks5://ada:secret@10.0.0.1:1080    # with credentials
+chromectl start --proxy 10.0.0.1:8080 --proxy-auth 'ada:p@ss:word'   # creds outside the URL
+chromectl start --proxy 10.0.0.1:8080 --proxy-bypass 'localhost,*.internal'
+chromectl start --proxy-pac http://wpad/proxy.pac            # PAC file instead
+```
+
+Chrome has no way to accept proxy **credentials** on the command line — it opens a login
+dialog, which is no help headless. So when your proxy needs a username/password, chromectl
+starts a tiny local relay (`chromectl.proxyrelay`), points Chrome at it, and the relay adds
+the credentials on the way upstream — HTTP `CONNECT` tunnels and SOCKS5 alike. The relay
+belongs to the instance: `stop` shuts it down with the browser, and `instances` shows it.
+
+- Credentials are handed to the relay through the environment, never argv (argv is visible
+  to every user via `ps`), and `instances` masks the password.
+- The relay listens on 127.0.0.1 only, and speaks to one upstream proxy.
+- SOCKS4 has no password auth — use `socks5://` or an HTTP proxy if you need credentials.
+- Chrome **bypasses proxies for loopback** by default. To route `127.0.0.1` traffic through
+  the proxy too (useful when testing), add `--proxy-bypass '<-loopback>'`.
+- Nothing else changes: chromectl still talks CDP to the browser directly on localhost.
 
 `--copy-profile` auto-detects your default Chrome user-data-dir (per-OS), copies it into
 `--profile` (skipping caches), and launches from the copy — so you debug **with your real

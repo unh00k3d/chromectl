@@ -10,6 +10,8 @@ chromectl start --name work --auto-port   # a second instance on a free port, na
 chromectl start --name work           # start 'work' again later -> SAME profile, logins persist
 chromectl start --copy-profile        # launch with a COPY of your real profile (logins)
 chromectl start --ephemeral           # throwaway /tmp profile (no persistence)
+chromectl start --proxy user:pass@host:8080   # proxy (credentials handled for you)
+chromectl start -- --lang=tr --window-size=1280,800   # any extra Chrome flags
 chromectl instances                   # list managed instances + up/down (--json, --prune)
 chromectl stop work                   # stop by name/port; stop --all; stop work --purge (delete profile)
 ```
@@ -18,6 +20,32 @@ Profiles **persist by default** per name — cookies/logins survive restarts. Ta
 
 ```bash
 chromectl -i work open https://site && chromectl -i work read --json
+```
+
+## Proxies and extra Chrome flags (`start` only)
+
+```bash
+chromectl start --proxy 10.0.0.1:8080                  # http proxy (scheme defaults to http)
+chromectl start --proxy socks5://ada:secret@10.0.0.1:1080   # socks5 + credentials
+chromectl start --proxy 10.0.0.1:8080 --proxy-auth 'ada:p@ss:word'  # creds kept out of the URL
+chromectl start --proxy 10.0.0.1:8080 --proxy-bypass 'localhost,*.internal'
+chromectl start --proxy-pac http://wpad/proxy.pac      # PAC file instead of --proxy
+```
+
+Chrome cannot take proxy credentials on the command line (it pops a login dialog, useless
+headless), so when the proxy has a username/password chromectl runs a small local relay that
+adds them upstream and points Chrome at that; `stop` shuts the relay down with the browser.
+Credentials never appear in argv, and `instances` shows the password masked. Loopback is
+exempt from the proxy by Chrome's own default — pass `--proxy-bypass '<-loopback>'` to send
+127.0.0.1 traffic through it too.
+
+Extra Chrome flags go after a bare `--`, or one at a time with `--chrome-arg`
+(use `--chrome-arg=--flag` when the value starts with a dash). A flag you pass **overrides**
+the same flag chromectl sets, so `-- --headless=old` or `-- --user-data-dir=/tmp/p` win:
+
+```bash
+chromectl start --name tr -- --lang=tr --disable-gpu --host-resolver-rules='MAP * 1.2.3.4'
+chromectl start --chrome-arg=--disable-dev-shm-usage --chrome-arg=--window-size=640,480
 ```
 
 ## Prefer `run` for multi-step tasks
@@ -46,7 +74,7 @@ chromectl -i work run --step 'open https://site/login' \
 | command | usage | what |
 |---|---|---|
 | `list (ls)` | `--json` | list open targets (tabs) |
-| `start` | `--name NAME --auto-port --profile PROFILE --ephemeral --headful --binary BINARY --copy-profile --from-profile PATH` | launch a Chrome instance (headless by default) |
+| `start` | `--name NAME --auto-port --profile PROFILE --ephemeral --headful --binary BINARY --copy-profile --from-profile PATH --proxy URL --proxy-auth USER:PASS --proxy-bypass LIST --proxy-pac URL --chrome-arg FLAG [-- FLAG...]` | launch a Chrome instance (headless by default) |
 | `instances (ps)` | `--json --prune` | list managed Chrome instances and their status |
 | `stop` | `[which] --all --purge` | stop a managed instance (by name/port) or --all |
 | `version` | `` | browser + protocol version |
