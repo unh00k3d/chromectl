@@ -30,6 +30,7 @@ import shlex
 import sys
 import threading
 import time
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import urlopen, Request
 
@@ -51,13 +52,74 @@ def out_json(obj):
     print(json.dumps(obj, indent=2, default=str))
 
 
+class UserError(RuntimeError):
+    """A failure caused by the request itself (bad target, timeout, JS throw).
+
+    Carries a machine-readable `kind` so --json callers can branch on it instead
+    of scraping prose. Raised instead of exiting so a `run` step can fail alone.
+    """
+
+    def __init__(self, message, kind="error"):
+        super().__init__(message)
+        self.kind = kind
+
+
+# The whole `error.kind` vocabulary, in one place. It used to live in three
+# hand-written doc lists that had already drifted apart; now the docs are
+# generated from this and a unit test greps the source to prove nothing new
+# slipped in unlisted.
+ERROR_KINDS = {
+    "error": "unclassified failure (the default)",
+    "bad-args": "the arguments contradict each other or are missing",
+    "no-instance": "no managed instance by that name/port (see: chromectl instances)",
+    "no-target": "no target matched, or the one that did can't be driven",
+    "not-found": "the thing named does not exist (a file, a binary, an element)",
+    "exists": "something with that name/port is already there",
+    "timeout": "gave up waiting",
+    "js-exception": "the page's JavaScript threw",
+    "no-snapshot": "no saved snapshot for this instance (run: chromectl snapshot)",
+    "no-history": "nothing to go back/forward to",
+    "no-storage": "the target has no accessible web storage",
+    "close-failed": "the browser refused to close that target",
+    "launch-failed": "the process we started never opened the debug port",
+    "missing-dep": "an external tool this command needs is not installed",
+    "tool-failed": "an external tool ran but failed",
+    "connection": "nothing reachable on that host:port",
+    "cdp": "the browser rejected the command (its own message is passed through)",
+}
+
+
+def emit(a, payload, render=None):
+    """Agent mode prints the payload as JSON; human mode runs the rich renderer.
+
+    Every command funnels its result through here, so `--json` means the same
+    thing everywhere: one JSON value on stdout, nothing else.
+    """
+    if getattr(a, "json", False):
+        out_json(payload)
+    elif render is not None:
+        render()
+    return payload
+
+
 # --------------------------------------------------------------------------
 # HTTP discovery endpoints
 # --------------------------------------------------------------------------
 def _http(host, port, path, method="GET"):
     url = f"http://{host}:{port}{path}"
-    with urlopen(Request(url, method=method), timeout=10) as r:
-        body = r.read().decode()
+    try:
+        with urlopen(Request(url, method=method), timeout=10) as r:
+            body = r.read().decode()
+    except HTTPError as e:
+        # The endpoint's real complaint is in the *body* — "Not supported",
+        # "No such target id", and so on. urllib's str() throws it away and
+        # leaves you with a bare "HTTP Error 500", so read it back out and
+        # pass the browser's own words through to the caller.
+        try:
+            detail = e.read().decode("utf-8", "replace").strip()[:400]
+        except Exception:
+            detail = ""
+        raise CDPError(f"{e.code} {e.reason}" + (f": {detail}" if detail else "")) from None
     return json.loads(body) if body.strip() else {}
 
 
@@ -69,28 +131,93 @@ def browser_ws(host, port):
     return _http(host, port, "/json/version")["webSocketDebuggerUrl"]
 
 
-def new_target(host, port, url):
+def _target_ws(t):
+    """The per-target debugger url, or a clean error saying why there isn't one.
+
+    Not every target can be driven: one that is closing, or a kind the browser
+    won't hand out a session for, simply arrives without the key. Subscripting
+    it blind turned that into a KeyError traceback.
+    """
+    ws = t.get("webSocketDebuggerUrl")
+    if not ws:
+        raise UserError(
+            f"target {str(t.get('id', ''))[:16]} (type {t.get('type', '?')}) exposes no "
+            f"debugger url — it can't be driven; see: chromectl list", "no-target")
+    return ws
+
+
+def _await_load(host, port, t, want, timeout=10):
+    """Wait for a freshly created target to actually be the page that was asked for.
+
+    `Target.createTarget` returns as soon as the target exists, which is before it
+    has navigated: it still reports `about:blank`, an empty url, and no title. Any
+    command that ran straight afterwards — the documented `run --step 'open URL'
+    --step 'read'` pattern — could read the blank page instead. So settle first,
+    then re-read the target so the caller gets the real url and title.
+
+    A page that never finishes loading is not an error; we return what we have.
+    """
+    ws = t.get("webSocketDebuggerUrl")
+    if not ws:
+        return t
+    blank = want.startswith("about:")
+    c = CDP(ws)
+    try:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                r = c.call("Runtime.evaluate",
+                           {"expression": "[location.href, document.readyState]",
+                            "returnByValue": True})
+                href, state = r["result"]["value"]
+                if state == "complete" and (blank or not href.startswith("about:")):
+                    break
+            except (CDPError, KeyError, TypeError, ValueError):
+                pass                       # mid-navigation: the context can go away
+            time.sleep(0.1)
+    finally:
+        c.close()
+    for cand in list_targets(host, port):  # url and title are populated now
+        if cand["id"] == t["id"]:
+            return cand
+    return t
+
+
+def new_target(host, port, url, wait_load=False):
     # Use CDP Target.createTarget (url is a JSON string) instead of /json/new?<url>,
     # which would put a raw, space-containing URL into the HTTP request path.
     c = CDP(browser_ws(host, port))
     try:
         tid = c.call("Target.createTarget", {"url": url})["targetId"]
+    except CDPError as e:
+        # Not every Chromium embedder has a tab model. Electron answers this
+        # with "Not supported" — say so in its own words rather than ours, and
+        # point at the windows that *are* open.
+        raise UserError(
+            f"this browser refused Target.createTarget: {e} — it has no tab model; "
+            f"drive a window that is already open (see: chromectl list)", "cdp") from None
     finally:
         c.close()
     for _ in range(30):                       # resolve full target info (incl. its WS url)
         for t in list_targets(host, port):
             if t["id"] == tid:
-                return t
+                return _await_load(host, port, t, url) if wait_load else t
         time.sleep(0.1)
-    return {"id": tid, "url": url}
+    raise UserError(f"created target {tid} but it never appeared in /json/list", "no-target")
+
+
+def _close_target(host, port, tid):
+    """Close a target; return (ok, why) so the caller can report the real reason."""
+    try:
+        _http(host, port, f"/json/close/{tid}")
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
 
 def close_target(host, port, tid):
-    try:
-        _http(host, port, f"/json/close/{tid}")
-        return True
-    except Exception:
-        return False
+    """Teardown-safe close: never raises, so a `finally:` can't mask a real error."""
+    return _close_target(host, port, tid)[0]
 
 
 def get_protocol(host, port):
@@ -187,19 +314,32 @@ class CDP:
 # --------------------------------------------------------------------------
 # target resolution
 # --------------------------------------------------------------------------
+def _attachable(targets):
+    """Targets we can open a session on, best first.
+
+    A 'page' wins when there is one; otherwise anything carrying a debugger url
+    will do. A Chromium embedder need not have a tab model at all, and its
+    windows may come back as 'webview' or 'other' — insisting on 'page' there
+    means reporting "nothing open" at a browser full of windows.
+    """
+    ok = [t for t in targets if t.get("webSocketDebuggerUrl") and t.get("type") != "browser"]
+    return [t for t in ok if t.get("type") == "page"] or ok
+
+
 def resolve(host, port, match, require_page=True):
     """Turn a user-supplied match (id / id-prefix / url or title substring /
-    'browser' / '' for first page) into a target dict."""
+    'browser' / '' for first attachable target) into a target dict."""
     if match == "browser":
         return {"id": "browser", "type": "browser", "title": "browser",
                 "url": "", "webSocketDebuggerUrl": browser_ws(host, port)}
     targets = list_targets(host, port)
     if not match:
-        pages = [t for t in targets if t["type"] == "page"]
-        if not pages:
-            err.print("no page targets open (try: cdp open <url>)")
-            sys.exit(1)
-        return pages[0]
+        cand = _attachable(targets)
+        if not cand:
+            kinds = ", ".join(sorted({t.get("type", "?") for t in targets})) or "none"
+            raise UserError(f"no attachable target on {host}:{port} "
+                            f"(targets present: {kinds}) — see: chromectl list", "no-target")
+        return cand[0]
     for t in targets:               # exact id
         if t["id"] == match:
             return t
@@ -215,8 +355,7 @@ def resolve(host, port, match, require_page=True):
     for t in targets:               # last resort: any type
         if ml in t.get("url", "").lower() or ml in t.get("title", "").lower():
             return t
-    err.print(f"no target matching {match!r}")
-    sys.exit(1)
+    raise UserError(f"no target matching {match!r}", "no-target")
 
 
 # --- connection pooling, active only during `run` (one connection per target) ---
@@ -226,7 +365,7 @@ _RUN_POOL = {}   # ws_url -> CDP
 
 def connect(host, port, match, require_page=True):
     t = resolve(host, port, match, require_page)
-    ws = t["webSocketDebuggerUrl"]
+    ws = _target_ws(t)
     if _RUN_ACTIVE:
         c = _RUN_POOL.get(ws)
         if c is None:
@@ -245,7 +384,7 @@ def _pw_page_for(a, browser):
     try:
         t = resolve(a.host, a.port, a.target)
         tid, url = t.get("id"), t.get("url", "")
-    except SystemExit:
+    except (UserError, SystemExit):
         pass
     pairs = [(c, pg) for c in browser.contexts for pg in c.pages]
     if tid and tid != "browser":
@@ -364,7 +503,19 @@ def _default_profile_dir():
 
 
 # --- instance registry (managed Chrome processes) ---
-STATE_FILE = os.path.expanduser("~/.chromectl/instances.json")
+# CHROMECTL_STATE lets a test (or a sandbox) point the registry somewhere else,
+# so a subprocess-driven run never touches the user's real instances.
+STATE_FILE = os.environ.get("CHROMECTL_STATE") or os.path.expanduser("~/.chromectl/instances.json")
+
+
+def _inst_kind(i):
+    """What's on the other end: 'chrome' or 'app'. Entries predating the field are Chrome."""
+    return i.get("kind", "chrome")
+
+
+def _inst_managed(i):
+    """Did *we* spawn this process? Entries predating the field were all ours."""
+    return i.get("managed", True)
 
 
 def _load_instances():
@@ -443,8 +594,8 @@ def _extra_chrome_args(a):
         extra.append(arg if arg.startswith("-") else "--" + arg)
     for arg in (a.chrome_args or []):
         if not arg.startswith("-"):
-            err.print(f"stray argument {arg!r} after `--` — Chrome flags start with a dash")
-            sys.exit(1)
+            raise UserError(f"stray argument {arg!r} after `--` — Chrome flags start "
+                            f"with a dash", "bad-args")
         extra.append(arg)
     return extra
 
@@ -460,11 +611,10 @@ def _proxy_plan(a):
     from . import proxyrelay
     flags, info = [], {}
     if a.proxy and a.proxy_pac:
-        err.print("--proxy and --proxy-pac are two ways to pick a proxy — keep one")
-        sys.exit(1)
+        raise UserError("--proxy and --proxy-pac are two ways to pick a proxy — keep one",
+                        "bad-args")
     if a.proxy_auth and not a.proxy:
-        err.print("--proxy-auth needs a --proxy to authenticate against")
-        sys.exit(1)
+        raise UserError("--proxy-auth needs a --proxy to authenticate against", "bad-args")
     if a.proxy_pac:
         flags.append(f"--proxy-pac-url={a.proxy_pac}")
         info["proxy"] = f"pac:{a.proxy_pac}"
@@ -479,15 +629,14 @@ def _proxy_plan(a):
     try:
         up = proxyrelay.parse_proxy(a.proxy, user, password)
     except ValueError as e:
-        err.print(str(e))
-        sys.exit(1)
+        raise UserError(str(e), "bad-args") from None
     info["proxy"] = proxyrelay.proxy_str(up)
     if not up["user"]:                              # no credentials: Chrome can do it alone
         flags.append(f"--proxy-server={up['scheme']}://{up['host']}:{up['port']}")
         return flags, None, info
     if up["scheme"] == "socks4":
-        err.print("SOCKS4 has no password auth — use socks5:// or an http:// proxy")
-        sys.exit(1)
+        raise UserError("SOCKS4 has no password auth — use socks5:// or an http:// proxy",
+                        "bad-args")
     return flags, up, info
 
 
@@ -505,8 +654,8 @@ def _start_relay(up, info, port_hint):
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     for _ in range(30):
         if relay.poll() is not None:
-            err.print("proxy relay exited immediately — check the --proxy URL")
-            sys.exit(1)
+            raise UserError("proxy relay exited immediately — check the --proxy URL",
+                            "launch-failed")
         try:
             with _socket.create_connection(("127.0.0.1", relay_port), 0.3):
                 break
@@ -514,8 +663,8 @@ def _start_relay(up, info, port_hint):
             time.sleep(0.1)
     else:
         relay.kill()
-        err.print(f"proxy relay did not come up on 127.0.0.1:{relay_port}")
-        sys.exit(1)
+        raise UserError(f"proxy relay did not come up on 127.0.0.1:{relay_port}",
+                        "launch-failed")
     console.print(f"[cyan]proxy[/cyan] {info['proxy']} "
                   f"[dim](authenticating relay on 127.0.0.1:{relay_port}, pid {relay.pid})[/dim]")
     info["relay_pid"], info["relay_port"] = relay.pid, relay_port
@@ -536,21 +685,81 @@ def _kill_relay(inst):
         err.print(f"relay pid {pid}: {e}")
 
 
+def _launch_flags(a, port, profile):
+    """The command line we hand the process we're about to start.
+
+    `profile` is None when we must not dictate one. An app instance exists to
+    drive the user's real, logged-in application; --user-data-dir would send it
+    to an empty one instead, which defeats the entire point. Isolation stays
+    opt-in, via --profile/--ephemeral.
+
+    An app also gets exactly ONE flag from us. The rest are Chrome-shaped and an
+    app's own argv parser has every right to choke on them — some treat an
+    unknown switch as a file to open. The user can still add any flag with
+    --chrome-arg or after a bare `--`, and theirs win. We omit, never forbid.
+    """
+    flags = [f"--remote-debugging-port={port}"]
+    if profile:
+        flags.append(f"--user-data-dir={profile}")
+    if not getattr(a, "app", None):
+        flags += ["--no-first-run", "--no-default-browser-check", "--remote-allow-origins=*"]
+        if not a.headful:
+            flags.insert(0, "--headless=new")
+    return _merge_chrome_flags(flags, _extra_chrome_args(a))
+
+
+def _tail(path, n=800):
+    """Last n characters of a log file, for reporting a launch that went nowhere."""
+    if not path:
+        return ""
+    try:
+        with open(path, errors="replace") as f:
+            return f.read()[-n:].strip()
+    except Exception:
+        return ""
+
+
+def _version_info(host, port):
+    """(kind, browser, agent) for whatever is on that port.
+
+    Electron reports `Browser: Chrome/<version>` just like Chrome does — the
+    only honest marker is the Electron token in the user agent, e.g.
+    `… Slack/4.33.84 Chrome/114.0.5735.289 Electron/25.3.1 Safari/537.36`.
+    One generic substring, deliberately not a table of known applications.
+    """
+    v = _http(host, port, "/json/version")
+    agent = v.get("User-Agent", "")
+    return ("app" if "Electron/" in agent else "chrome"), v.get("Browser", ""), agent
+
+
 def cmd_start(a):
     import shutil
     import subprocess
-    binary = a.binary or next((b for b in CHROME_BINARIES if shutil.which(b)), None)
-    if not binary:
-        err.print("no Chrome/Chromium found on PATH — pass --binary /path/to/chrome")
-        sys.exit(1)
+    import tempfile
+    if a.app and a.binary:
+        raise UserError("--app and --binary both name the executable — keep one", "bad-args")
+    if a.app:
+        binary = shutil.which(a.app) or (a.app if os.path.isfile(a.app) else None)
+        if not binary:
+            raise UserError(f"no such executable: {a.app}", "not-found")
+        if a.copy_profile or a.from_profile:
+            raise UserError("--copy-profile clones a Chrome profile; an app instance "
+                            "already has its own (drop the flag, or use --profile)", "bad-args")
+    else:
+        binary = a.binary or next((b for b in CHROME_BINARIES if shutil.which(b)), None)
+        if not binary:
+            raise UserError("no Chrome/Chromium found on PATH — pass --binary /path/to/chrome "
+                            "(or --app PATH for an Electron app)", "not-found")
     proxy_flags, needs_auth, proxy_info = _proxy_plan(a)   # fail on a bad proxy before anything runs
     port = _free_port(a.host) if a.auto_port else a.port
-    label = a.name or f"chrome-{port}"
+    label = a.name or (f"app-{port}" if a.app else f"chrome-{port}")
     existing = _find_instance(label)
     if a.profile:                                  # explicit dir wins
         profile = os.path.expanduser(a.profile)
     elif a.ephemeral:                              # throwaway, fresh each run
         profile = f"/tmp/chromectl-profile-{port}"
+    elif a.app:                                    # an app keeps its OWN data dir — see _launch_flags
+        profile = None
     elif existing and existing.get("profile"):     # reuse this instance's previous dir
         profile = existing["profile"]
     else:                                          # stable, persistent per name (logins survive restarts)
@@ -559,11 +768,10 @@ def cmd_start(a):
     if a.copy_profile or a.from_profile:
         src = a.from_profile or _default_profile_dir()
         if not os.path.isdir(src):
-            err.print(f"source profile not found: {src}  (pass --from-profile PATH)")
-            sys.exit(1)
+            raise UserError(f"source profile not found: {src}  (pass --from-profile PATH)", "not-found")
         if os.path.abspath(src) == os.path.abspath(profile):
-            err.print("source and destination profile are the same — pick a different --profile")
-            sys.exit(1)
+            raise UserError("source and destination profile are the same — pick a different --profile",
+                            "bad-args")
         ignore = shutil.ignore_patterns(
             "Cache", "Code Cache", "GPUCache", "ShaderCache", "GraphiteDawnCache",
             "DawnGraphiteCache", "DawnWebGPUCache", "Service Worker", "CacheStorage",
@@ -572,38 +780,51 @@ def cmd_start(a):
         try:
             shutil.copytree(src, profile, ignore=ignore, dirs_exist_ok=True, symlinks=True)
         except Exception as e:
-            err.print(f"copy failed: {e}\n(close Chrome using that profile first, or use --from-profile a copy)")
-            sys.exit(1)
+            raise UserError(f"copy failed: {e} (close Chrome using that profile first, "
+                            f"or point --from-profile at a copy)", "bad-args") from None
         console.print("[yellow]note:[/yellow] this profile carries your real cookies/logins — "
                       "anyone who reaches the debug port can act as you. Keep it local; delete when done.")
-    flags = [f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
-             "--no-first-run", "--no-default-browser-check", "--remote-allow-origins=*"]
-    if not a.headful:
-        flags.insert(0, "--headless=new")
     extra = _extra_chrome_args(a)
     if a.proxy and any(_switch_name(f) == "--proxy-server" for f in extra):
-        err.print("--proxy and a hand-passed --proxy-server do the same job — keep one")
-        sys.exit(1)
-    flags = _merge_chrome_flags(flags, extra)          # user flags override ours
+        raise UserError("--proxy and a hand-passed --proxy-server do the same job — keep one",
+                        "bad-args")
+    flags = _launch_flags(a, port, profile)            # user flags override ours
     port = int(_switch_value(flags, "--remote-debugging-port") or port)
     profile = _switch_value(flags, "--user-data-dir") or profile
     if _port_alive(a.host, port):
-        err.print(f"port {port} already has a live Chrome — pick another --port or use --auto-port")
-        sys.exit(1)
+        raise UserError(f"port {port} already has a live browser — drive it with "
+                        f"`chromectl adopt {port}`, or pick another --port / --auto-port", "exists")
     if needs_auth:
         proxy_flags.append(_start_relay(needs_auth, proxy_info, port))
     flags = _merge_chrome_flags(flags, proxy_flags)
     argv = [binary] + flags
-    proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            start_new_session=True)
-    for _ in range(40):
+    # An app's own stdout/stderr is the only account we'll get of a launch that
+    # goes nowhere, so keep it — in a file, not a PIPE, because a chatty app
+    # fills the 64K pipe buffer and deadlocks with nobody reading.
+    logpath, logfh = None, subprocess.DEVNULL
+    if a.app:
+        fd, logpath = tempfile.mkstemp(prefix="chromectl-app-", suffix=".log")
+        logfh = os.fdopen(fd, "w")
+    try:
+        proc = subprocess.Popen(argv, stdout=logfh, stderr=subprocess.STDOUT if a.app else logfh,
+                                start_new_session=True)
+    finally:
+        if a.app:
+            logfh.close()
+    span = a.wait if a.wait is not None else (45.0 if a.app else 12.0)
+    deadline = time.time() + span
+    while time.time() < deadline:
         if _port_alive(a.host, port):
-            name = a.name or f"chrome-{port}"
+            name = a.name or (f"app-{port}" if a.app else f"chrome-{port}")
+            kind, browser, agent = _version_info(a.host, port)
             inst = {"name": name, "host": a.host, "port": port, "pid": proc.pid,
                     "profile": profile, "headful": bool(a.headful), "binary": binary,
+                    "kind": kind, "managed": True, "browser": browser, "agent": agent,
                     "created": time.strftime("%Y-%m-%d %H:%M:%S"), **proxy_info}
             if extra:
                 inst["chrome_args"] = extra
+            if logpath:
+                inst["log"] = logpath
             stale = [i for i in _load_instances()
                      if (i.get("port") == port and i.get("host") == a.host) or i.get("name") == name]
             for i in stale:
@@ -615,15 +836,40 @@ def cmd_start(a):
             items = [i for i in _load_instances() if i not in stale]
             items.append(inst)
             _save_instances(items)
-            v = _http(a.host, port, "/json/version")
-            console.print(f"[green]Chrome up[/green] [bold]{name}[/bold] on {a.host}:{port}  "
-                          f"[dim]({v.get('Browser','?')}, pid {proc.pid}, profile {profile})[/dim]")
-            console.print(f"[dim]target it with:  chromectl -i {name} <cmd>   (or --port {port})[/dim]")
-            return
+
+            def render():
+                what = "app up" if kind == "app" else "Chrome up"
+                where = f"profile {profile}" if profile else "its own profile"
+                console.print(f"[green]{what}[/green] [bold]{name}[/bold] on {a.host}:{port}  "
+                              f"[dim]({browser or '?'}, pid {proc.pid}, {where})[/dim]")
+                if kind == "app":
+                    console.print("[yellow]note:[/yellow] this is the application's real, "
+                                  "signed-in session — anyone who reaches the debug port is you. "
+                                  "Keep it on localhost.")
+                console.print(f"[dim]target it with:  chromectl -i {name} <cmd>   (or --port {port})[/dim]")
+
+            return emit(a, {"ok": True, "name": name, "host": a.host, "port": port,
+                            "pid": proc.pid, "kind": kind, "browser": browser,
+                            "profile": profile, "binary": binary}, render)
+        if proc.poll() is not None:            # it died, or handed off and exited
+            break
         time.sleep(0.3)
     _kill_relay(proxy_info)
-    err.print("Chrome did not come up in time (try --headful to see errors)")
-    sys.exit(1)
+    rc, what = proc.poll(), os.path.basename(binary)
+    if rc is not None:
+        msg = (f"{what} exited (code {rc}) without opening port {port}. "
+               f"If it was already running, a single-instance lock forwards the second "
+               f"launch to the first process and drops our flags — quit it fully and retry. "
+               f"If it is not Chromium/Electron-based it will not accept "
+               f"--remote-debugging-port at all.")
+    else:
+        msg = (f"{what} is running but never opened port {port} within {span:g}s "
+               f"(raise it with --wait SECONDS).")
+    tail = _tail(logpath)
+    if logpath:
+        with contextlib.suppress(OSError):
+            os.unlink(logpath)
+    raise UserError(msg + (f"\n--- its output ---\n{tail}" if tail else ""), "launch-failed")
 
 
 def cmd_instances(a):
@@ -645,19 +891,104 @@ def cmd_instances(a):
     tbl = Table(header_style="bold cyan", title="chromectl instances")
     cols = ["name", "status", "host:port", "pid", "profile", "started"]
     show_proxy = any(i.get("proxy") for i in items)
+    show_kind = any(_inst_kind(i) != "chrome" for i in items)
+    if show_kind:
+        cols.insert(2, "kind")
     if show_proxy:
-        cols.insert(5, "proxy")
+        cols.insert(5 + show_kind, "proxy")
     for col in cols:
         tbl.add_column(col)
     for i in items:
         status = "[green]up[/green]" if i["up"] else "[red]down[/red]"
-        row = [i.get("name", "?"), status, f"{i.get('host')}:{i.get('port')}",
-               str(i.get("pid", "-")), (i.get("profile", "") or "")[-32:]]
+        if not _inst_managed(i):
+            status += " [dim](adopted)[/dim]"
+        row = [i.get("name", "?"), status]
+        if show_kind:
+            row.append(_inst_kind(i))
+        row += [f"{i.get('host')}:{i.get('port')}", str(i.get("pid") or "-"),
+                (i.get("profile") or "-")[-32:]]
         if show_proxy:
             row.append(i.get("proxy", "-"))
         row.append(i.get("created", ""))
         tbl.add_row(*row)
     console.print(tbl)
+
+
+def _ua_product(agent):
+    """The application's own product token out of a user agent, if there is one.
+
+    `… Slack/4.33.84 Chrome/114.0.5735.289 Electron/25.3.1 Safari/537.36` → 'slack'.
+    Purely to suggest a default instance name; nothing branches on the result.
+    """
+    import re
+    generic = {"mozilla", "applewebkit", "khtml", "gecko", "chrome", "chromium",
+               "headlesschrome", "electron", "safari", "version", "like", "edg", "mobile"}
+    # Drop the platform parenthetical — "(X11; Linux x86_64)" is not a product.
+    for token in re.sub(r"\([^)]*\)", " ", agent).split():
+        if "/" not in token:
+            continue                     # a product token is always Name/Version
+        name = token.split("/", 1)[0].lower()
+        if name and name not in generic and name.isidentifier():
+            return name
+    return ""
+
+
+def cmd_adopt(a):
+    """Record a debug port somebody else opened, so `-i NAME` works against it.
+
+    We start nothing here, and `stop` will refuse to kill what we did not start —
+    on the other end of that port may be the user's real, signed-in application.
+    """
+    port = int(a.port_arg) if a.port_arg else a.port
+    if not _port_alive(a.host, port):
+        raise UserError(f"nothing is listening on {a.host}:{port} — start the app with "
+                        f"--remote-debugging-port={port} first (it must not already be "
+                        f"running: a single-instance lock swallows the flag)", "connection")
+    v = _http(a.host, port, "/json/version")
+    if not v.get("webSocketDebuggerUrl"):
+        raise UserError(f"{a.host}:{port} answers HTTP but is not a DevTools endpoint "
+                        f"(no webSocketDebuggerUrl in /json/version)", "connection")
+    agent = v.get("User-Agent", "")
+    kind = "app" if "Electron/" in agent else "chrome"
+    name = a.name or _ua_product(agent) or f"{kind}-{port}"
+    already = next((i for i in _load_instances()
+                    if i.get("port") == port and i.get("host") == a.host), None)
+    if already and _inst_managed(already) and not a.force:
+        raise UserError(f"port {port} is already the managed instance "
+                        f"{already.get('name')!r} — drive it with `-i {already.get('name')}` "
+                        f"(--force relabels it without forgetting we started it)", "exists")
+    clash = _find_instance(name)
+    if clash and not a.force:
+        raise UserError(f"instance {name!r} already exists on port {clash.get('port')} — "
+                        f"pass --name, or --force to replace it", "exists")
+    # Whether we started the process is a fact about history, not a label, so
+    # re-adopting a port we launched keeps its pid and stays managed. Dropping
+    # them would strand a browser we own: `stop` would refuse to touch it and
+    # nothing else knows the pid.
+    inst = {"name": name, "host": a.host, "port": port,
+            "pid": already.get("pid") if already else None,
+            "profile": already.get("profile") if already else None,
+            "kind": kind, "managed": bool(already and _inst_managed(already)),
+            "browser": v.get("Browser", ""), "agent": agent,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if already and already.get("log"):
+        inst["log"] = already["log"]
+    items = [i for i in _load_instances()
+             if i.get("name") != name and not (i.get("port") == port and i.get("host") == a.host)]
+    items.append(inst)
+    _save_instances(items)
+    n = len(_attachable(list_targets(a.host, port)))
+
+    def render():
+        console.print(f"[green]adopted[/green] [bold]{name}[/bold] on {a.host}:{port}  "
+                      f"[dim]({inst['browser'] or '?'}, {kind}, {n} attachable target"
+                      f"{'' if n == 1 else 's'})[/dim]")
+        if not inst["managed"]:
+            console.print(f"[dim]not started by chromectl — `stop {name}` will refuse "
+                          f"to kill it[/dim]")
+        console.print(f"[dim]drive it with:  chromectl -i {name} <cmd>   (or --port {port})[/dim]")
+
+    return emit(a, {**inst, "ok": True, "targets": n}, render)
 
 
 def cmd_stop(a):
@@ -667,19 +998,39 @@ def cmd_stop(a):
         targets = list(items)
     else:
         if not a.which:
-            err.print("say which: a name, a port, or --all")
-            sys.exit(1)
+            raise UserError("say which: a name, a port, or --all", "bad-args")
         hit = _find_instance(a.which)
         if hit:
             targets = [hit]
         elif str(a.which).isdigit():          # a bare port not in the registry
             targets = [{"name": a.which, "host": a.host, "port": int(a.which), "pid": None}]
         else:
-            err.print(f"no instance named/port {a.which!r} (see: chromectl instances)")
-            sys.exit(1)
-    stopped_keys = set()
+            raise UserError(f"no instance named/port {a.which!r} (see: chromectl instances)",
+                            "no-instance")
+    stopped_keys, forgotten, results = set(), set(), []
+    say = (lambda *_: None) if getattr(a, "json", False) else console.print
     for t in targets:
         pid, port, host = t.get("pid"), t.get("port"), t.get("host", "localhost")
+        name = t.get("name", "?")
+        if not _inst_managed(t) and not a.force:
+            # We adopted this one. Behind that port is somebody's real application,
+            # and the pkill fallback below would take it down with no warning.
+            if a.forget or a.all:
+                forgotten.add((host, port))
+                results.append({"name": name, "port": port, "action": "forgot"})
+                say(f"[yellow]forgot[/yellow] {name} [dim](port {port}) — "
+                    f"not started by chromectl; left running[/dim]")
+                continue
+            raise UserError(
+                f"{name} was adopted, not started by chromectl — it is running as pid "
+                f"{pid if pid else 'unknown'} and stopping it would quit the real application. "
+                f"Use `stop {name} --forget` to drop it from the registry, or "
+                f"`stop {name} --force` to actually kill it.", "bad-args")
+        if a.forget:                           # drop the entry, leave the process alone
+            forgotten.add((host, port))
+            results.append({"name": name, "port": port, "action": "forgot"})
+            say(f"[yellow]forgot[/yellow] {name} [dim](port {port}) — left running[/dim]")
+            continue
         ok = False
         if pid:
             try:
@@ -688,39 +1039,60 @@ def cmd_stop(a):
             except ProcessLookupError:
                 ok = True                      # already gone
             except Exception as e:
-                err.print(f"{t.get('name')}: {e}")
+                err.print(f"{name}: {e}")
         if not ok or pid is None:
+            # A managed app can outlive the pid we recorded: an Electron single-instance
+            # lock hands our launch to the first process, which then exits. The port is
+            # still ours, and we started it with exactly this flag, so matching on it is safe.
             os.system(f'pkill -f "remote-debugging-port={port}" 2>/dev/null')
         _kill_relay(t)
-        msg = f"[green]stopped[/green] {t.get('name','?')} [dim](port {port})[/dim]"
+        msg = f"[green]stopped[/green] {name} [dim](port {port})[/dim]"
         if a.purge and t.get("profile"):
             import shutil
             import time as _t
             _t.sleep(0.3)                      # let Chrome release the profile
             shutil.rmtree(t["profile"], ignore_errors=True)
             msg += f"  [yellow]purged[/yellow] {t['profile']}"
-        console.print(msg)
+        if t.get("log"):
+            with contextlib.suppress(OSError):
+                os.unlink(t["log"])
+        say(msg)
+        results.append({"name": name, "port": port, "action": "stopped"})
         stopped_keys.add((host, port))
-    remaining = [i for i in items if (i.get("host", "localhost"), i.get("port")) not in stopped_keys]
+    gone = stopped_keys | forgotten
+    remaining = [i for i in items if (i.get("host", "localhost"), i.get("port")) not in gone]
     _save_instances(remaining)
+    if getattr(a, "json", False):
+        out_json({"ok": True, "instances": results})
 
 
 def cmd_version(a):
     v = _http(a.host, a.port, "/json/version")
-    console.print(Panel(JSON(json.dumps(v)), title="Browser", border_style="cyan"))
+    return emit(a, v, lambda: console.print(
+        Panel(JSON(json.dumps(v)), title="Browser", border_style="cyan")))
 
 
 def cmd_open(a):
-    t = new_target(a.host, a.port, a.url)
-    console.print(f"[green]opened[/green] {t['url']}")
-    console.print(f"  id:  [dim]{t['id']}[/dim]")
+    # wait for it to land: the tab we hand back is immediately readable, and the
+    # url/title we report are the page's, not the blank one it started as
+    t = new_target(a.host, a.port, a.url, wait_load=True)
+
+    def render():
+        console.print(f"[green]opened[/green] {t.get('url') or a.url}")
+        console.print(f"  id:  [dim]{t['id']}[/dim]")
+
+    emit(a, {"ok": True, "id": t["id"], "url": t.get("url") or a.url,
+             "title": t.get("title", "")}, render)
     return t
 
 
 def cmd_close(a):
     t = resolve(a.host, a.port, a.target)
-    ok = close_target(a.host, a.port, t["id"])
-    console.print(f"[{'green' if ok else 'red'}]{'closed' if ok else 'failed to close'}[/] {t.get('url','')}")
+    ok, why = _close_target(a.host, a.port, t["id"])
+    if not ok:
+        raise UserError(f"could not close {t.get('url','')}: {why}", "close-failed")
+    return emit(a, {"ok": True, "id": t["id"], "url": t.get("url", "")},
+                lambda: console.print(f"[green]closed[/green] {t.get('url','')}"))
 
 
 def cmd_goto(a):
@@ -742,8 +1114,11 @@ def cmd_goto(a):
                 continue
             if m.get("method") == "Page.loadEventFired":
                 loaded.set()
-        console.print(f"[green]navigated[/green] {t.get('url','')} → {a.url}"
-                      f" {'(loaded)' if loaded.is_set() else '(load not confirmed)'}")
+        return emit(a, {"ok": True, "url": a.url, "from": t.get("url", ""),
+                        "loaded": loaded.is_set()},
+                    lambda: console.print(
+                        f"[green]navigated[/green] {t.get('url','')} → {a.url}"
+                        f" {'(loaded)' if loaded.is_set() else '(load not confirmed)'}"))
     finally:
         c.close()
 
@@ -758,13 +1133,16 @@ def cmd_eval(a):
         })
         if "exceptionDetails" in r:
             ex = r["exceptionDetails"]
-            err.print("JS exception: " + ex.get("exception", {}).get("description", ex.get("text", "")))
-            sys.exit(1)
+            raise UserError(ex.get("exception", {}).get("description", ex.get("text", "")), "js-exception")
         val = r["result"].get("value", r["result"].get("description"))
-        if isinstance(val, (dict, list)):
-            console.print(JSON(json.dumps(val)))
-        else:
-            console.print(val)
+
+        def render():
+            if isinstance(val, (dict, list)):
+                console.print(JSON(json.dumps(val)))
+            else:
+                console.print(val)
+
+        return emit(a, val, render)
     finally:
         c.close()
 
@@ -778,11 +1156,15 @@ def cmd_html(a):
         if a.out:
             with open(a.out, "w") as f:
                 f.write(html)
-            console.print(f"[green]wrote[/green] {len(html)} chars → {a.out}")
-        else:
+            return emit(a, {"ok": True, "chars": len(html), "out": a.out},
+                        lambda: console.print(f"[green]wrote[/green] {len(html)} chars → {a.out}"))
+
+        def render():
             console.print(Syntax(html[:a.max], "html", theme="ansi_dark", word_wrap=True))
             if len(html) > a.max:
                 console.print(f"[dim]… truncated ({len(html)} total). Use --out to save all.[/dim]")
+
+        return emit(a, {"ok": True, "chars": len(html), "html": html}, render)
     finally:
         c.close()
 
@@ -792,7 +1174,9 @@ def cmd_text(a):
     try:
         r = c.call("Runtime.evaluate",
                    {"expression": "document.body.innerText", "returnByValue": True})
-        console.print(r["result"].get("value", ""))
+        txt = r["result"].get("value", "") or ""
+        return emit(a, {"ok": True, "chars": len(txt), "text": txt},
+                    lambda: console.print(txt))
     finally:
         c.close()
 
@@ -800,10 +1184,32 @@ def cmd_text(a):
 def cmd_cookies(a):
     c, t = connect(a.host, a.port, a.target)
     try:
+        if a.clear:
+            c.call("Network.clearBrowserCookies")
+            return emit(a, {"ok": True, "cleared": True},
+                        lambda: console.print("[green]cleared[/green] all cookies"))
+        changed = []
+        for spec in a.set:
+            if "=" not in spec:
+                raise UserError(f"bad --set {spec!r} — use name=value", "bad-args")
+            name, value = spec.split("=", 1)
+            ck = {"name": name, "value": value, "url": a.url or t.get("url", "")}
+            if not ck["url"]:
+                raise UserError("no URL for the cookie — pass --url", "bad-args")
+            if a.domain:
+                ck["domain"] = a.domain
+            c.call("Network.setCookie", ck)
+            changed.append(name)
+        for name in a.delete:
+            c.call("Network.deleteCookies", {"name": name,
+                                             "url": a.url or t.get("url", "")})
+            changed.append(name)
         cookies = c.call("Network.getCookies").get("cookies", [])
+        if changed and not a.json:
+            console.print(f"[green]updated[/green] {', '.join(changed)}")
         if a.json:
-            console.print(JSON(json.dumps(cookies)))
-            return
+            out_json(cookies)
+            return cookies
         tbl = Table(title=f"cookies for {t.get('url','')}", header_style="bold cyan")
         for col in ("name", "value", "domain", "path", "flags"):
             tbl.add_column(col, max_width=40 if col == "value" else None)
@@ -835,7 +1241,8 @@ def cmd_screenshot(a):
         out = a.out or f"screenshot-{int(time.time())}.png"
         with open(out, "wb") as f:
             f.write(base64.b64decode(data))
-        console.print(f"[green]saved[/green] → {out}")
+        return emit(a, {"ok": True, "out": os.path.abspath(out), "full": bool(a.full)},
+                    lambda: console.print(f"[green]saved[/green] → {out}"))
     finally:
         c.close()
 
@@ -848,7 +1255,8 @@ def cmd_pdf(a):
         out = a.out or f"page-{int(time.time())}.pdf"
         with open(out, "wb") as f:
             f.write(base64.b64decode(data))
-        console.print(f"[green]saved[/green] → {out}")
+        return emit(a, {"ok": True, "out": os.path.abspath(out)},
+                    lambda: console.print(f"[green]saved[/green] → {out}"))
     finally:
         c.close()
 
@@ -893,8 +1301,7 @@ def _focus(c, selector):
                       f"if(!e)return false;e.focus();return true;}})()",
         "returnByValue": True})
     if not r["result"].get("value"):
-        err.print(f"selector not found: {selector}")
-        sys.exit(1)
+        raise UserError(f"selector not found: {selector}", "not-found")
 
 
 def cmd_emulate(a):
@@ -944,24 +1351,33 @@ def cmd_emulate(a):
                         "downloadThroughput": int(down), "uploadThroughput": int(up)})
             applied.append(f"network:{a.throttle}")
         if not applied:
-            err.print("nothing to emulate — see --help")
-            return
-        console.print("[green]applied[/green] " + "; ".join(applied))
+            raise UserError("nothing to emulate — see --help", "bad-args")
+        result = {"ok": True, "applied": applied}
+        if not getattr(a, "json", False):
+            console.print("[green]applied[/green] " + "; ".join(applied))
         if getattr(a, "shot", None):
             c.call("Page.enable")
             data = c.call("Page.captureScreenshot",
                           {"format": "png", "captureBeyondViewport": True})["data"]
             with open(a.shot, "wb") as f:
                 f.write(base64.b64decode(data))
-            console.print(f"[green]screenshot[/green] → {a.shot}")
+            result["shot"] = os.path.abspath(a.shot)
+            if not getattr(a, "json", False):
+                console.print(f"[green]screenshot[/green] → {a.shot}")
+        if getattr(a, "json", False):
+            out_json(result)
+            if not getattr(a, "hold", False):
+                return result
         if getattr(a, "hold", False):
-            console.print("[dim]holding session so overrides persist — Ctrl-C to release[/dim]")
+            if not getattr(a, "json", False):
+                console.print("[dim]holding session so overrides persist — Ctrl-C to release[/dim]")
             try:
                 while True:
                     time.sleep(0.5)
             except KeyboardInterrupt:
-                console.print("\n[dim]released (overrides revert)[/dim]")
-        elif not getattr(a, "shot", None):
+                if not getattr(a, "json", False):
+                    console.print("\n[dim]released (overrides revert)[/dim]")
+        elif not getattr(a, "shot", None) and not getattr(a, "json", False):
             console.print("[dim]note: CDP overrides revert when this connection closes; "
                           "use --hold to keep them active, or --shot to capture now.[/dim]")
     finally:
@@ -982,7 +1398,8 @@ def cmd_press(a):
             _focus(c, a.selector)
         for key in a.keys:
             _press_key(c, key)
-        console.print(f"[green]pressed[/green] {' '.join(a.keys)}")
+        return emit(a, {"ok": True, "pressed": list(a.keys)},
+                    lambda: console.print(f"[green]pressed[/green] {' '.join(a.keys)}"))
     finally:
         c.close()
 
@@ -996,7 +1413,9 @@ def cmd_type(a):
         c.call("Input.insertText", {"text": text})
         if a.enter:
             _press_key(c, "Enter")
-        console.print(f"[green]typed[/green] {len(text)} chars" + (" + Enter" if a.enter else ""))
+        return emit(a, {"ok": True, "chars": len(text), "enter": bool(a.enter)},
+                    lambda: console.print(f"[green]typed[/green] {len(text)} chars"
+                                          + (" + Enter" if a.enter else "")))
     finally:
         c.close()
 
@@ -1005,18 +1424,17 @@ def cmd_upload(a):
     files = [os.path.abspath(f) for f in a.files]
     for f in files:
         if not os.path.exists(f):
-            err.print(f"no such file: {f}")
-            sys.exit(1)
+            raise UserError(f"no such file: {f}", "bad-args")
     c, t = connect(a.host, a.port, a.target)
     try:
         c.call("DOM.enable")
         r = c.call("Runtime.evaluate", {"expression": f"document.querySelector({json.dumps(a.selector)})"})
         obj = r["result"].get("objectId")
         if not obj:
-            err.print(f"selector not found (or not an element): {a.selector}")
-            sys.exit(1)
+            raise UserError(f"selector not found (or not an element): {a.selector}", "not-found")
         c.call("DOM.setFileInputFiles", {"files": files, "objectId": obj})
-        console.print(f"[green]set[/green] {len(files)} file(s) on {a.selector}")
+        return emit(a, {"ok": True, "files": files, "selector": a.selector},
+                    lambda: console.print(f"[green]set[/green] {len(files)} file(s) on {a.selector}"))
     finally:
         c.close()
 
@@ -1084,8 +1502,11 @@ def cmd_heapsnapshot(a):
         out = a.out or f"heap-{int(time.time())}.heapsnapshot"
         with open(out, "w") as f:
             f.write(data)
-        console.print(f"[green]saved[/green] {len(data):,} bytes → {out}")
-        console.print("[dim]load in Chrome DevTools ▸ Memory ▸ Load profile[/dim]")
+        def render():
+            console.print(f"[green]saved[/green] {len(data):,} bytes → {out}")
+            console.print("[dim]load in Chrome DevTools ▸ Memory ▸ Load profile[/dim]")
+
+        return emit(a, {"ok": True, "out": os.path.abspath(out), "bytes": len(data)}, render)
     finally:
         c.close()
 
@@ -1207,14 +1628,9 @@ def cmd_wait(a):
                     what = "network idle"
                     page.wait_for_load_state("networkidle", timeout=a.timeout)
                 else:
-                    err.print("specify --selector / --text / --url / --network-idle")
-                    sys.exit(1)
+                    raise UserError("specify --selector / --text / --url / --network-idle", "bad-args")
             except PWTimeout:
-                if a.json:
-                    out_json({"ok": False, "waited": what})
-                else:
-                    err.print(f"timeout waiting for {what}")
-                sys.exit(1)
+                raise UserError(f"timeout waiting for {what}", "timeout")
             if a.json:
                 out_json({"ok": True, "waited": what, "url": page.url})
             else:
@@ -1228,8 +1644,7 @@ def cmd_fillform(a):
     fields = []
     for s in a.set:
         if "=" not in s:
-            err.print(f"bad --set {s!r} — use selector=value")
-            sys.exit(1)
+            raise UserError(f"bad --set {s!r} — use selector=value", "bad-args")
         sel, val = s.split("=", 1)
         fields.append((sel, val))
     results, submitted, url = [], False, ""
@@ -1290,6 +1705,19 @@ VITAL_THRESH = {
 }
 
 
+def _scratch_target(a, hint):
+    """A blank tab to work in, or the browser's own refusal plus the way around it.
+
+    Opening a scratch tab is how the URL form of perf/capture/seo works. A browser
+    with no tab model can't, and the useful thing to say then is not "it failed"
+    but which flag reaches a window that is already open.
+    """
+    try:
+        return new_target(a.host, a.port, "about:blank")
+    except UserError as e:
+        raise UserError(f"{e} {hint}", e.kind) from None
+
+
 def _rate(metric, val):
     good, needs, _ = VITAL_THRESH[metric]
     if val <= good:
@@ -1303,8 +1731,8 @@ def cmd_perf(a):
     if a.attach:
         c, t = connect(a.host, a.port, a.attach)
     else:
-        t = new_target(a.host, a.port, "about:blank")
-        c = CDP(t["webSocketDebuggerUrl"])
+        t = _scratch_target(a, "— use `--attach TARGET` to measure one.")
+        c = CDP(_target_ws(t))
     trace_events = []
     do_trace = bool(a.out)
     try:
@@ -1391,8 +1819,7 @@ def cmd_lighthouse(a):
                     lh = cand
                     break
     if not lh:
-        err.print("lighthouse CLI not found. Install it with:  npm i -g lighthouse")
-        sys.exit(1)
+        raise UserError("lighthouse CLI not found. Install it with:  npm i -g lighthouse", "missing-dep")
 
     cats = a.categories.split(",") if a.categories else None
     cmd = [lh, a.url, f"--port={a.port}", "--output=json", "--output-path=stdout",
@@ -1406,8 +1833,7 @@ def cmd_lighthouse(a):
     with console.status("[cyan]running Lighthouse…[/cyan]"):
         p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=180)
     if p.returncode != 0 or not p.stdout.strip():
-        err.print(f"lighthouse failed:\n{p.stderr[-800:]}")
-        sys.exit(1)
+        raise UserError(f"lighthouse failed: {p.stderr[-800:]}", "tool-failed")
     report = json.loads(p.stdout)
     if a.out:
         with open(a.out, "w") as f:
@@ -1442,7 +1868,17 @@ def cmd_lighthouse(a):
 
 
 # ---- Tier 2: Playwright-over-CDP interaction (lazy-imported) ----
-SNAP_FILE = ".chromectl-snap.json"
+SNAP_DIR = os.path.expanduser("~/.chromectl/snaps")
+
+
+def _snap_file(a):
+    """Where `snapshot` parks its refs: per instance, never in the user's CWD.
+
+    A single shared file in the working directory both littered whatever repo an
+    agent happened to be in and let two instances overwrite each other's refs.
+    """
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    return os.path.join(SNAP_DIR, f"{getattr(a, 'host', 'localhost')}-{getattr(a, 'port', 9222)}.json")
 
 SNAPSHOT_JS = r"""() => {
   function cssPath(el){
@@ -1500,12 +1936,13 @@ def _find_page(browser, match):
 def _locate(page, a):
     """Return (locator, human-description) from --ref/--selector/--text/--role[--name]."""
     if getattr(a, "ref", None) is not None:
-        if not os.path.exists(SNAP_FILE):
-            raise CDPError(f"no {SNAP_FILE} — run `cdp snapshot <target>` first")
-        data = json.load(open(SNAP_FILE))
+        snap = _snap_file(a)
+        if not os.path.exists(snap):
+            raise UserError("no saved snapshot — run `chromectl snapshot` first", "no-snapshot")
+        data = json.load(open(snap))
         els = data.get("elements", [])
         if not (0 <= a.ref < len(els)):
-            raise CDPError(f"--ref {a.ref} out of range (0..{len(els)-1})")
+            raise UserError(f"--ref {a.ref} out of range (0..{len(els)-1})", "bad-args")
         e = els[a.ref]
         return page.locator(e["selector"]).first, f"ref {a.ref} ({e['role']} {e['name']!r})"
     if getattr(a, "selector", None):
@@ -1515,7 +1952,8 @@ def _locate(page, a):
         return page.get_by_role(a.role, **kw).first, f"role={a.role} name={getattr(a,'name',None)!r}"
     if getattr(a, "text", None):
         return page.get_by_text(a.text).first, f"text {a.text!r}"
-    raise CDPError("specify a target element: --ref N | --selector CSS | --text STR | --role ROLE [--name STR]")
+    raise UserError("specify a target element: --ref N | --selector CSS | --text STR | "
+                    "--role ROLE [--name STR]", "bad-args")
 
 
 def cmd_snapshot(a):
@@ -1528,16 +1966,24 @@ def cmd_snapshot(a):
             url = page.url
         finally:
             b.close()
-    out = a.out or SNAP_FILE
+    out = a.out or _snap_file(a)
     with open(out, "w") as f:
         json.dump({"url": url, "elements": els}, f, indent=2)
-    tbl = Table(title=f"interactive elements · {url[:60]}", header_style="bold cyan")
-    tbl.add_column("#", justify="right"); tbl.add_column("role")
-    tbl.add_column("name", max_width=48); tbl.add_column("selector", max_width=38, style="dim")
     for i, e in enumerate(els):
-        tbl.add_row(str(i), e["role"], e["name"] or "—", e["selector"])
-    console.print(tbl)
-    console.print(f"[dim]{len(els)} elements → refs saved to {out}. Use e.g. `cdp click {a.target or ''} --ref 0`[/dim]")
+        e["ref"] = i
+
+    def render():
+        tbl = Table(title=f"interactive elements · {url[:60]}", header_style="bold cyan")
+        tbl.add_column("#", justify="right"); tbl.add_column("role")
+        tbl.add_column("name", max_width=48); tbl.add_column("selector", max_width=38, style="dim")
+        for e in els:
+            tbl.add_row(str(e["ref"]), e["role"], e["name"] or "—", e["selector"])
+        console.print(tbl)
+        console.print(f"[dim]{len(els)} elements → refs saved to {out}. "
+                      f"Use e.g. `chromectl click {a.target or ''} --ref 0`[/dim]")
+
+    return emit(a, {"ok": True, "url": url, "count": len(els),
+                    "refs": out, "elements": els}, render)
 
 
 def cmd_click(a):
@@ -1550,12 +1996,15 @@ def cmd_click(a):
             try:
                 loc.click(timeout=a.timeout)
             except PWTimeout:
-                err.print(f"click timed out on {desc} "
-                          f"(not found / not visible / not actionable within {int(a.timeout)}ms)")
-                sys.exit(1)
+                raise UserError(f"click timed out on {desc} (not found / not visible / "
+                                f"not actionable within {int(a.timeout)}ms)", "timeout")
             page.wait_for_timeout(150)
-            console.print(f"[green]clicked[/green] {desc}")
-            console.print(f"[dim]url now: {page.url}[/dim]")
+
+            def render():
+                console.print(f"[green]clicked[/green] {desc}")
+                console.print(f"[dim]url now: {page.url}[/dim]")
+
+            return emit(a, {"ok": True, "clicked": desc, "url": page.url}, render)
         finally:
             b.close()
 
@@ -1571,11 +2020,13 @@ def cmd_fill(a):
             try:
                 loc.fill(value, timeout=a.timeout)
             except PWTimeout:
-                err.print(f"fill timed out on {desc}")
-                sys.exit(1)
+                raise UserError(f"fill timed out on {desc}", "timeout")
             if a.enter:
                 loc.press("Enter")
-            console.print(f"[green]filled[/green] {desc} = {value!r}" + (" + Enter" if a.enter else ""))
+            return emit(a, {"ok": True, "filled": desc, "value": value, "enter": bool(a.enter),
+                            "url": page.url},
+                        lambda: console.print(f"[green]filled[/green] {desc} = {value!r}"
+                                              + (" + Enter" if a.enter else "")))
         finally:
             b.close()
 
@@ -1590,17 +2041,23 @@ def cmd_hover(a):
             try:
                 loc.hover(timeout=a.timeout)
             except PWTimeout:
-                err.print(f"hover timed out on {desc}")
-                sys.exit(1)
-            console.print(f"[green]hovered[/green] {desc}")
+                raise UserError(f"hover timed out on {desc}", "timeout")
+            return emit(a, {"ok": True, "hovered": desc, "url": page.url},
+                        lambda: console.print(f"[green]hovered[/green] {desc}"))
         finally:
             b.close()
 
 
 def cmd_run(a):
-    """Run a sequence of cdp steps in ONE process over pooled connections.
+    """Run a sequence of chromectl steps in ONE process over pooled connections.
+
     Steps come from --step (repeatable), a FILE, or stdin. One opened tab becomes
-    the implicit target for later steps that omit one. State persists across steps."""
+    the implicit target for later steps. State persists across steps.
+
+    With --json every step runs in its own --json mode and the whole batch comes
+    back as one array, so a caller can read what each step actually returned
+    rather than scraping a rendered transcript.
+    """
     global _RUN_ACTIVE
     if a.step:
         raw = a.step
@@ -1609,16 +2066,18 @@ def cmd_run(a):
         raw = list(src)
     steps = [s.strip() for s in raw if s.strip() and not s.strip().startswith("#")]
     if not steps:
-        err.print("no steps given (use --step, a FILE, or stdin)")
-        sys.exit(1)
+        raise UserError("no steps given (use --step, a FILE, or stdin)", "bad-args")
 
+    agent = getattr(a, "json", False)
     parser = build_parser()
     _RUN_ACTIVE = True
     current = a.target or ""
-    failed = 0
+    results, failed = [], 0
     try:
         for i, line in enumerate(steps, 1):
-            console.print(Rule(f"[dim]step {i}/{len(steps)}[/dim] [cyan]{escape_rule(line)}[/cyan]", align="left"))
+            if not agent:
+                console.print(Rule(f"[dim]step {i}/{len(steps)}[/dim] [cyan]{escape_rule(line)}[/cyan]",
+                                   align="left"))
             tokens = shlex.split(line)
             sa = None
             with contextlib.redirect_stderr(io.StringIO()):   # hush argparse's tentative errors
@@ -1632,21 +2091,37 @@ def cmd_run(a):
                         except SystemExit:
                             sa = None
             if sa is None:
-                err.print(f"step {i}: could not parse {line!r}")
+                msg = f"could not parse {line!r}"
+                results.append({"step": i, "cmd": line, "ok": False,
+                                "error": {"kind": "bad-args", "message": msg}})
                 failed += 1
+                if not agent:
+                    err.print(f"step {i}: {msg}")
                 if not a.keep_going:
                     break
                 continue
             sa.host, sa.port = a.host, a.port
             if hasattr(sa, "target") and not getattr(sa, "target") and current:
                 sa.target = current          # implicit current tab (optional-target commands)
+            if agent and hasattr(sa, "json"):
+                sa.json = True               # every step speaks JSON inside a --json run
             try:
-                res = sa.fn(sa)
+                buf = io.StringIO()
+                # a step's own rendering is captured, never interleaved with the batch JSON
+                with contextlib.redirect_stdout(buf) if agent else contextlib.nullcontext():
+                    res = sa.fn(sa)
                 if sa.fn is cmd_open and isinstance(res, dict):
                     current = res.get("id", current)   # opened tab → implicit target
-            except (CDPError, TimeoutError, ConnectionError, OSError, ValueError) as e:
-                err.print(f"step {i} failed: {e}")
+                if agent:
+                    results.append({"step": i, "cmd": line, "ok": True,
+                                    "result": _step_payload(buf.getvalue(), res)})
+            except (UserError, CDPError, TimeoutError, ConnectionError, OSError, ValueError) as e:
+                kind = getattr(e, "kind", type(e).__name__.lower().replace("error", "") or "error")
+                results.append({"step": i, "cmd": line, "ok": False,
+                                "error": {"kind": kind, "message": str(e)}})
                 failed += 1
+                if not agent:
+                    err.print(f"step {i} failed: {e}")
                 if not a.keep_going:
                     break
     finally:
@@ -1655,10 +2130,29 @@ def cmd_run(a):
             c._pooled = False
             c.close()
         _RUN_POOL.clear()
-    if failed:
+    if agent:
+        out_json({"ok": failed == 0, "steps": len(steps), "failed": failed,
+                  "results": results})
+    elif failed:
         console.print(f"[red]{failed} step(s) failed[/red]")
+    else:
+        console.print(f"[green]done[/green] · {len(steps)} steps")
+    if failed:
         sys.exit(1)
-    console.print(f"[green]done[/green] · {len(steps)} steps")
+    return results
+
+
+def _step_payload(captured, returned):
+    """Best-effort structured result for one step of a --json run."""
+    text = captured.strip()
+    if text:
+        try:
+            return json.loads(text)
+        except ValueError:
+            return {"output": text}
+    if isinstance(returned, (dict, list, str, int, float, bool)) or returned is None:
+        return returned
+    return {"output": str(returned)}
 
 
 def escape_rule(s):
@@ -1674,8 +2168,7 @@ def cmd_raw(a):
         r = c.call(a.method, params)
         console.print(JSON(json.dumps(r)))
     except json.JSONDecodeError as e:
-        err.print(f"bad JSON params: {e}")
-        sys.exit(1)
+        raise UserError(f"bad JSON params: {e}", "bad-args")
     finally:
         c.close()
 
@@ -1870,8 +2363,8 @@ def cmd_capture(a):
         page_url = t.get("url", "")
         console.print(f"[cyan]attached to[/cyan] {page_url}")
     else:
-        t = new_target(a.host, a.port, "about:blank")
-        c = CDP(t["webSocketDebuggerUrl"])
+        t = _scratch_target(a, "— use `--attach TARGET` to capture one.")
+        c = CDP(_target_ws(t))
         page_url = a.url
 
     records = {}          # requestId -> record
@@ -1960,26 +2453,45 @@ def cmd_capture(a):
         by_type[r.get("type", "?")] = by_type.get(r.get("type", "?"), 0) + 1
         s = r.get("statusCode") or r.get("resp", {}).get("status", "-")
         by_status[s] = by_status.get(s, 0) + 1
-    console.print(Rule(f"[bold]{len(rows)} transactions[/bold] for {page_url}"))
-    console.print("  by type:   " + "  ".join(f"{k}={v}" for k, v in by_type.items()))
-    console.print("  by status: " + "  ".join(f"{k}={v}" for k, v in by_status.items()))
-
-    # render to console
-    for r in rows[:a.print]:
-        req = r.get("req", {})
-        console.print(Rule(f"[green]{req.get('method','?')}[/green] {req.get('url','')[:80]}", style="dim"))
-        console.print(_record_to_raw(r, a.bodycap))
+    agent = getattr(a, "json", False)
+    if not agent:
+        console.print(Rule(f"[bold]{len(rows)} transactions[/bold] for {page_url}"))
+        console.print("  by type:   " + "  ".join(f"{k}={v}" for k, v in by_type.items()))
+        console.print("  by status: " + "  ".join(f"{k}={v}" for k, v in by_status.items()))
+        # render to console
+        for r in rows[:a.print]:
+            req = r.get("req", {})
+            console.print(Rule(f"[green]{req.get('method','?')}[/green] {req.get('url','')[:80]}",
+                               style="dim"))
+            console.print(_record_to_raw(r, a.bodycap))
 
     # save raw
     if a.out:
         with open(a.out, "w") as f:
             f.write("\n\n".join(_record_to_raw(r, 10 ** 9) for r in rows))
-        console.print(f"[green]raw dump[/green] ({len(rows)}) → {a.out}")
+        if not agent:
+            console.print(f"[green]raw dump[/green] ({len(rows)}) → {a.out}")
     # save HAR
     if a.har:
         with open(a.har, "w") as f:
             json.dump(_build_har(rows, page_url), f, indent=2)
-        console.print(f"[green]HAR[/green] → {a.har}  (import into DevTools ▸ Network, or Burp)")
+        if not agent:
+            console.print(f"[green]HAR[/green] → {a.har}  "
+                          f"(import into DevTools ▸ Network, or Burp)")
+    if agent:
+        # bodies are dropped here on purpose: --out/--har carry them, and a full
+        # capture inlined into a tool result is nearly always too big to be useful
+        out_json({"ok": True, "url": page_url, "count": len(rows),
+                  "by_type": by_type, "by_status": {str(k): v for k, v in by_status.items()},
+                  "out": os.path.abspath(a.out) if a.out else None,
+                  "har": os.path.abspath(a.har) if a.har else None,
+                  "transactions": [{"method": r.get("req", {}).get("method"),
+                                    "url": r.get("req", {}).get("url"),
+                                    "type": r.get("type"),
+                                    "status": r.get("statusCode") or r.get("resp", {}).get("status"),
+                                    "mime": r.get("resp", {}).get("mimeType"),
+                                    "bytes": len(r.get("body") or "")} for r in rows]})
+    return rows
 
 
 SEO_JS = r"""(() => {
@@ -2024,8 +2536,8 @@ SEO_JS = r"""(() => {
 def cmd_seo(a):
     opened = False
     if a.target.startswith("http://") or a.target.startswith("https://"):
-        t = new_target(a.host, a.port, "about:blank")
-        c = CDP(t["webSocketDebuggerUrl"]); opened = True
+        t = _scratch_target(a, "— pass a target selector instead of a URL.")
+        c = CDP(_target_ws(t)); opened = True
         c.call("Page.enable"); c.call("Page.navigate", {"url": a.target})
         deadline = time.time() + 15
         loaded = any(m.get("method") == "Page.loadEventFired" for m in c.buf); c.buf.clear()
@@ -2097,39 +2609,51 @@ def cmd_console(a):
     c, t = connect(a.host, a.port, a.target)
     lvl_color = {"log": "white", "info": "cyan", "debug": "dim", "warning": "yellow",
                  "error": "red", "verbose": "dim"}
+    quiet = getattr(a, "json", False)
+    collected = []
 
     def render_arg(arg):
         if "value" in arg:
             return json.dumps(arg["value"]) if isinstance(arg["value"], (dict, list)) else str(arg["value"])
         return arg.get("description", arg.get("type", "?"))
 
-    console.print(Panel(f"console on {t.get('url', t['id'])}  —  Ctrl-C to stop",
-                        border_style="cyan"))
+    if not quiet:
+        console.print(Panel(f"console on {t.get('url', t['id'])}  —  Ctrl-C to stop",
+                            border_style="cyan"))
     try:
         c.call("Runtime.enable")
         c.call("Log.enable")
         # process anything already buffered from the enable calls (Log replays entries)
         pending = list(c.buf); c.buf.clear()
-        start = time.time()
+        started = time.time()
         while True:
             for m in pending:
                 method = m.get("method"); p = m.get("params", {})
                 if method == "Runtime.consoleAPICalled":
                     typ = p.get("type", "log")
-                    color = lvl_color.get(typ, "white")
                     text = " ".join(render_arg(x) for x in p.get("args", []))
-                    console.print(f"[{color}]console.{typ}[/{color}] {text}")
+                    collected.append({"kind": "console", "level": typ, "text": text})
+                    if not quiet:
+                        color = lvl_color.get(typ, "white")
+                        console.print(f"[{color}]console.{typ}[/{color}] {text}")
                 elif method == "Runtime.exceptionThrown":
                     ex = p.get("exceptionDetails", {})
                     desc = ex.get("exception", {}).get("description") or ex.get("text", "")
-                    console.print(f"[bold red]UNCAUGHT[/bold red] {desc.splitlines()[0] if desc else ''}")
+                    collected.append({"kind": "exception", "level": "error", "text": desc})
+                    if not quiet:
+                        console.print(f"[bold red]UNCAUGHT[/bold red] "
+                                      f"{desc.splitlines()[0] if desc else ''}")
                 elif method == "Log.entryAdded":
                     e = p.get("entry", {})
-                    color = lvl_color.get(e.get("level", "log"), "white")
-                    console.print(f"[{color}]{e.get('source','')}/{e.get('level','')}[/{color}] "
-                                  f"{e.get('text','')}  [dim]{e.get('url','')}[/dim]")
+                    collected.append({"kind": "log", "level": e.get("level", "log"),
+                                      "source": e.get("source", ""), "text": e.get("text", ""),
+                                      "url": e.get("url", "")})
+                    if not quiet:
+                        color = lvl_color.get(e.get("level", "log"), "white")
+                        console.print(f"[{color}]{e.get('source','')}/{e.get('level','')}[/{color}] "
+                                      f"{e.get('text','')}  [dim]{e.get('url','')}[/dim]")
             pending = []
-            if a.max and time.time() - start > a.max:
+            if a.max and time.time() - started > a.max:
                 break
             try:
                 pending = [c.q.get(timeout=0.5)]
@@ -2138,22 +2662,36 @@ def cmd_console(a):
             if pending and "__error__" in pending[0]:
                 break
     except KeyboardInterrupt:
-        console.print("\n[dim]stopped[/dim]")
+        if not quiet:
+            console.print("\n[dim]stopped[/dim]")
     finally:
         c.close()
+    if quiet:
+        out_json({"ok": True, "url": t.get("url", ""), "count": len(collected),
+                  "messages": collected})
+    return collected
 
 
 def cmd_watch(a):
+    """Tail network activity.
+
+    Bounded by --max seconds so an agent can call it without hanging forever;
+    with --json the whole tail comes back as one array at the end.
+    """
     c, t = connect(a.host, a.port, a.target)
-    reqs = {}
-    console.print(Panel(f"live network on {t.get('url', t['id'])}  —  Ctrl-C to stop",
-                        border_style="cyan"))
+    quiet = getattr(a, "json", False)
+    reqs, records = {}, []
+    if not quiet:
+        stop = f"{a.max}s" if a.max else "Ctrl-C"
+        console.print(Panel(f"live network on {t.get('url', t['id'])}  —  {stop} to stop",
+                            border_style="cyan"))
     try:
         c.call("Network.enable")
-        for m in list(c.buf):
-            pass
         c.buf.clear()
+        started = time.time()
         while True:
+            if a.max and time.time() - started > a.max:
+                break
             try:
                 m = c.q.get(timeout=0.5)
             except queue.Empty:
@@ -2166,17 +2704,534 @@ def cmd_watch(a):
             elif method == "Network.responseReceived":
                 resp = p["response"]; rtype = p.get("type", "")
                 status = resp.get("status", 0)
-                color = "green" if status < 300 else "yellow" if status < 400 else "red"
-                console.print(f"[{color}]{status}[/{color}] [dim]{rtype:11}[/dim] "
-                              f"{resp.get('url','')[:90]}")
+                records.append({"status": status, "type": rtype, "url": resp.get("url", ""),
+                                "mime": resp.get("mimeType", "")})
+                if not quiet:
+                    color = "green" if status < 300 else "yellow" if status < 400 else "red"
+                    console.print(f"[{color}]{status}[/{color}] [dim]{rtype:11}[/dim] "
+                                  f"{resp.get('url','')[:90]}")
             elif method == "Network.loadingFailed":
-                console.print(f"[red]ERR[/red] [dim]{p.get('type',''):11}[/dim] "
-                              f"{reqs.get(p['requestId'],{}).get('url','')[:90]} "
-                              f"[red]{p.get('errorText','')}[/red]")
+                url = reqs.get(p["requestId"], {}).get("url", "")
+                records.append({"status": None, "type": p.get("type", ""), "url": url,
+                                "error": p.get("errorText", "")})
+                if not quiet:
+                    console.print(f"[red]ERR[/red] [dim]{p.get('type',''):11}[/dim] "
+                                  f"{url[:90]} [red]{p.get('errorText','')}[/red]")
     except KeyboardInterrupt:
-        console.print("\n[dim]stopped[/dim]")
+        if not quiet:
+            console.print("\n[dim]stopped[/dim]")
     finally:
         c.close()
+    if quiet:
+        out_json({"ok": True, "url": t.get("url", ""), "count": len(records),
+                  "requests": records})
+    return records
+
+
+# --------------------------------------------------------------------------
+# navigation history, storage, auth state, a11y, interception, downloads
+# --------------------------------------------------------------------------
+def _history_move(a, delta):
+    """Step the tab's navigation history by delta entries (-1 back, +1 forward)."""
+    c, t = connect(a.host, a.port, a.target)
+    try:
+        c.call("Page.enable")
+        h = c.call("Page.getNavigationHistory")
+        idx, entries = h["currentIndex"], h["entries"]
+        want = idx + delta
+        if not (0 <= want < len(entries)):
+            where = "back" if delta < 0 else "forward"
+            raise UserError(f"no history to go {where}", "no-history")
+        target_entry = entries[want]
+        c.call("Page.navigateToHistoryEntry", {"entryId": target_entry["id"]})
+        time.sleep(0.3)
+        url = target_entry.get("url", "")
+        word = "back" if delta < 0 else "forward"
+        return emit(a, {"ok": True, "url": url, "index": want, "entries": len(entries)},
+                    lambda: console.print(f"[green]{word}[/green] → {url}"))
+    finally:
+        c.close()
+
+
+def cmd_back(a):
+    return _history_move(a, -1)
+
+
+def cmd_forward(a):
+    return _history_move(a, +1)
+
+
+def cmd_reload(a):
+    c, t = connect(a.host, a.port, a.target)
+    try:
+        c.call("Page.enable")
+        c.call("Page.reload", {"ignoreCache": bool(a.hard)})
+        loaded = False
+        deadline = time.time() + a.timeout
+        while time.time() < deadline:
+            try:
+                m = c.q.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            if m.get("method") == "Page.loadEventFired":
+                loaded = True
+                break
+        return emit(a, {"ok": True, "url": t.get("url", ""), "hard": bool(a.hard),
+                        "loaded": loaded},
+                    lambda: console.print(f"[green]reloaded[/green] {t.get('url','')}"
+                                          f" {'(loaded)' if loaded else '(load not confirmed)'}"))
+    finally:
+        c.close()
+
+
+# --- web storage -----------------------------------------------------------
+def _storage_area(a):
+    return "sessionStorage" if getattr(a, "session", False) else "localStorage"
+
+
+def _storage_eval(c, expr):
+    r = c.call("Runtime.evaluate", {"expression": expr, "returnByValue": True,
+                                    "awaitPromise": True})
+    if "exceptionDetails" in r:
+        ex = r["exceptionDetails"]
+        msg = ex.get("exception", {}).get("description", ex.get("text", ""))
+        # a page on about:blank or a sandboxed origin has no storage at all
+        raise UserError(f"storage unavailable on this page: {msg}", "no-storage")
+    return r["result"].get("value")
+
+
+def cmd_storage(a):
+    """Read or write localStorage / sessionStorage for the tab's origin."""
+    area = _storage_area(a)
+    c, t = connect(a.host, a.port, a.target)
+    try:
+        if a.clear:
+            _storage_eval(c, f"{area}.clear()")
+            return emit(a, {"ok": True, "area": area, "cleared": True},
+                        lambda: console.print(f"[green]cleared[/green] {area}"))
+        changed = []
+        for item in a.set:
+            if "=" not in item:
+                raise UserError(f"bad --set {item!r} — use key=value", "bad-args")
+            k, v = item.split("=", 1)
+            _storage_eval(c, f"{area}.setItem({json.dumps(k)},{json.dumps(v)})")
+            changed.append(k)
+        for k in a.remove:
+            _storage_eval(c, f"{area}.removeItem({json.dumps(k)})")
+            changed.append(k)
+        if a.get:
+            val = _storage_eval(c, f"{area}.getItem({json.dumps(a.get)})")
+            return emit(a, {"ok": True, "area": area, "key": a.get, "value": val},
+                        lambda: console.print(val if val is not None else "[dim]null[/dim]"))
+        items = _storage_eval(c, f"Object.fromEntries(Object.entries({area}))") or {}
+
+        def render():
+            if changed:
+                console.print(f"[green]updated[/green] {area}: {', '.join(changed)}")
+            tbl = Table(title=f"{area} · {t.get('url','')[:50]}", header_style="bold cyan")
+            tbl.add_column("key"); tbl.add_column("value", max_width=60)
+            for k, v in items.items():
+                tbl.add_row(k, str(v)[:60])
+            console.print(tbl)
+            console.print(f"[dim]{len(items)} keys[/dim]")
+
+        return emit(a, {"ok": True, "area": area, "url": t.get("url", ""),
+                        "changed": changed, "items": items}, render)
+    finally:
+        c.close()
+
+
+# --- auth / storage state --------------------------------------------------
+def _origin_of(url):
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme in ("http", "https") else ""
+
+
+def cmd_auth(a):
+    """Save or restore a login: cookies browser-wide + per-origin web storage.
+
+    The point is to log in once and replay the session into a fresh --ephemeral
+    instance, instead of copying a whole real Chrome profile just for its cookies.
+    """
+    if a.action == "save":
+        return _auth_save(a)
+    return _auth_load(a)
+
+
+def _auth_save(a):
+    c, _ = connect(a.host, a.port, "browser", require_page=False)
+    try:
+        cookies = c.call("Storage.getCookies").get("cookies", [])
+    finally:
+        c.close()
+    origins = []
+    pages = _attachable(list_targets(a.host, a.port))
+    wanted = {_origin_of(u) for u in a.origin} if a.origin else None
+    for t in pages:
+        origin = _origin_of(t.get("url", ""))
+        if not origin or (wanted is not None and origin not in wanted):
+            continue
+        if any(o["origin"] == origin for o in origins):
+            continue
+        pc = CDP(_target_ws(t))
+        try:
+            local = _storage_eval(pc, "Object.fromEntries(Object.entries(localStorage))") or {}
+            session = _storage_eval(pc, "Object.fromEntries(Object.entries(sessionStorage))") or {}
+        except UserError:
+            local, session = {}, {}      # about:blank and friends simply have none
+        finally:
+            pc.close()
+        origins.append({"origin": origin, "localStorage": local, "sessionStorage": session})
+    state = {"version": 1, "saved": time.strftime("%Y-%m-%dT%H:%M:%S"),
+             "cookies": cookies, "origins": origins}
+    with open(a.file, "w") as f:
+        json.dump(state, f, indent=2)
+    os.chmod(a.file, 0o600)              # it is a live session — don't leave it world-readable
+
+    def render():
+        console.print(f"[green]saved[/green] {len(cookies)} cookies, "
+                      f"{len(origins)} origin(s) → {a.file}")
+        console.print("[yellow]note:[/yellow] this file is a live login. Treat it like a password.")
+
+    return emit(a, {"ok": True, "file": os.path.abspath(a.file), "cookies": len(cookies),
+                    "origins": [o["origin"] for o in origins]}, render)
+
+
+def _auth_load(a):
+    if not os.path.exists(a.file):
+        raise UserError(f"no such file: {a.file}", "bad-args")
+    with open(a.file) as f:
+        state = json.load(f)
+    cookies = state.get("cookies", [])
+    c, _ = connect(a.host, a.port, "browser", require_page=False)
+    try:
+        if cookies:
+            c.call("Storage.setCookies", {"cookies": cookies})
+    finally:
+        c.close()
+    restored, skipped = [], []
+    open_docs = _attachable(list_targets(a.host, a.port))
+    for o in state.get("origins", []):
+        if not (o.get("localStorage") or o.get("sessionStorage")):
+            continue
+        # Web storage is per-origin and only reachable from a document on it.
+        # Prefer a window already sitting on that origin — it saves a round trip,
+        # and on a browser with no tab model it is the only way in. Only park a
+        # fresh tab when there isn't one.
+        hit = next((t for t in open_docs if _origin_of(t.get("url", "")) == o["origin"]), None)
+        opened = hit is None
+        if opened:
+            try:
+                t = new_target(a.host, a.port, o["origin"] + "/")
+            except UserError as e:
+                # No tab model, so this origin simply cannot be reached. The cookies
+                # already landed, so report the gap instead of throwing all of it away.
+                skipped.append({"origin": o["origin"], "reason": str(e)})
+                continue
+        else:
+            t = hit
+        pc = CDP(_target_ws(t))
+        try:
+            for area, items in (("localStorage", o.get("localStorage") or {}),
+                                ("sessionStorage", o.get("sessionStorage") or {})):
+                for k, v in items.items():
+                    _storage_eval(pc, f"{area}.setItem({json.dumps(k)},{json.dumps(str(v))})")
+            restored.append(o["origin"])
+        except UserError as e:          # origin unreachable (offline/DNS) — cookies still landed
+            skipped.append({"origin": o["origin"], "reason": str(e)})
+        finally:
+            pc.close()
+            if opened and not a.keep_tabs:   # never close a window we found already open
+                close_target(a.host, a.port, t["id"])
+
+    def render():
+        console.print(f"[green]restored[/green] {len(cookies)} cookies"
+                      + (f", storage for {len(restored)} origin(s)" if restored else ""))
+        for s in skipped:
+            console.print(f"[yellow]skipped[/yellow] {s['origin']}: {s['reason']}")
+
+    return emit(a, {"ok": not skipped, "cookies": len(cookies),
+                    "origins": restored, "skipped": skipped}, render)
+
+
+# --- accessibility tree ----------------------------------------------------
+BORING_ROLES = {"none", "presentation", "generic", "InlineTextBox", "StaticText", "LineBreak"}
+
+
+def cmd_a11y(a):
+    """Dump the accessibility tree — what a screen reader (and an agent) sees."""
+    c, t = connect(a.host, a.port, a.target)
+    try:
+        c.call("Accessibility.enable")
+        nodes = c.call("Accessibility.getFullAXTree", timeout=60).get("nodes", [])
+    finally:
+        c.close()
+
+    def prop(n, key):
+        v = n.get(key) or {}
+        return v.get("value") if isinstance(v, dict) else v
+
+    by_id = {n["nodeId"]: n for n in nodes}
+    kept = []
+    for n in nodes:
+        role = prop(n, "role") or ""
+        if n.get("ignored"):
+            continue
+        if not a.all and role in BORING_ROLES:
+            continue
+        kept.append({
+            "id": n["nodeId"],
+            "role": role,
+            "name": prop(n, "name") or "",
+            "value": prop(n, "value"),
+            "description": prop(n, "description") or "",
+            "depth": 0,
+            "parent": n.get("parentId"),
+        })
+    index = {k["id"]: k for k in kept}
+    for k in kept:                       # depth against the kept subset, not the raw tree
+        d, p = 0, k["parent"]
+        while p is not None and d < 64:
+            if p in index:
+                d += 1
+            p = by_id.get(p, {}).get("parentId")
+        k["depth"] = d
+    if a.max:
+        kept = kept[:a.max]
+
+    def render():
+        console.print(f"[bold]accessibility tree[/bold] [dim]{t.get('url','')[:70]}[/dim]")
+        for k in kept:
+            pad = "  " * min(k["depth"], 12)
+            name = f" [white]{k['name'][:60]!r}[/white]" if k["name"] else ""
+            val = f" [dim]= {str(k['value'])[:30]}[/dim]" if k["value"] not in (None, "") else ""
+            console.print(f"{pad}[cyan]{k['role']}[/cyan]{name}{val}")
+        console.print(f"[dim]{len(kept)} nodes[/dim]")
+
+    for k in kept:
+        k.pop("parent", None)
+    return emit(a, {"ok": True, "url": t.get("url", ""), "count": len(kept), "nodes": kept},
+                render)
+
+
+# --- request interception --------------------------------------------------
+def cmd_intercept(a):
+    """Block, stub, or rewrite requests while the session is held.
+
+    `capture` reads traffic; this one changes it — block a tracker, serve a fixed
+    JSON body for an endpoint, or add a header to everything.
+    """
+    stubs = []
+    for spec in a.stub:
+        if "=" not in spec:
+            raise UserError(f"bad --stub {spec!r} — use PATTERN=FILE", "bad-args")
+        pat, path = spec.split("=", 1)
+        if not os.path.exists(path):
+            raise UserError(f"no such stub file: {path}", "bad-args")
+        with open(path, "rb") as f:
+            stubs.append((pat, f.read(), path))
+    headers = {}
+    for h in a.header:
+        if ":" not in h:
+            raise UserError(f"bad --header {h!r} — use 'Name: value'", "bad-args")
+        k, v = h.split(":", 1)
+        headers[k.strip()] = v.strip()
+    if not (a.block or stubs or headers):
+        raise UserError("nothing to do — pass --block, --stub or --header", "bad-args")
+
+    import fnmatch
+
+    def matches(url, pat):
+        return fnmatch.fnmatch(url, pat) or pat in url
+
+    quiet = getattr(a, "json", False)
+    c, t = connect(a.host, a.port, a.target)
+    log = []
+    try:
+        patterns = [{"urlPattern": "*", "requestStage": "Request"}]
+        c.call("Fetch.enable", {"patterns": patterns})
+        if not quiet:
+            stop = f"{a.max}s" if a.max else "Ctrl-C"
+            console.print(Panel(f"intercepting on {t.get('url', t['id'])}  —  {stop} to stop",
+                                border_style="cyan"))
+        started = time.time()
+        while True:
+            if a.max and time.time() - started > a.max:
+                break
+            try:
+                m = c.q.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            if "__error__" in m:
+                break
+            if m.get("method") != "Fetch.requestPaused":
+                continue
+            p = m["params"]
+            rid, url = p["requestId"], p["request"]["url"]
+            action, detail = "continue", ""
+            try:
+                hit = next((s for s in stubs if matches(url, s[0])), None)
+                if any(matches(url, b) for b in a.block):
+                    c.call("Fetch.failRequest", {"requestId": rid, "errorReason": "BlockedByClient"})
+                    action, detail = "block", ""
+                elif hit:
+                    c.call("Fetch.fulfillRequest", {
+                        "requestId": rid, "responseCode": a.status,
+                        "responseHeaders": [{"name": "content-type", "value": a.content_type}],
+                        "body": base64.b64encode(hit[1]).decode()})
+                    action, detail = "stub", hit[2]
+                elif headers:
+                    merged = dict(p["request"].get("headers", {}))
+                    merged.update(headers)
+                    c.call("Fetch.continueRequest", {
+                        "requestId": rid,
+                        "headers": [{"name": k, "value": v} for k, v in merged.items()]})
+                    action = "headers"
+                else:
+                    c.call("Fetch.continueRequest", {"requestId": rid})
+            except CDPError:
+                continue                 # request died before we answered — nothing to do
+            log.append({"action": action, "url": url, "detail": detail})
+            if not quiet and action != "continue":
+                color = {"block": "red", "stub": "yellow", "headers": "cyan"}[action]
+                console.print(f"[{color}]{action:8}[/{color}] {url[:90]} "
+                              f"[dim]{detail}[/dim]")
+    except KeyboardInterrupt:
+        if not quiet:
+            console.print("\n[dim]stopped[/dim]")
+    finally:
+        try:
+            c.call("Fetch.disable", timeout=5)
+        except Exception:
+            pass
+        c.close()
+    counts = {}
+    for e in log:
+        counts[e["action"]] = counts.get(e["action"], 0) + 1
+    if quiet:
+        out_json({"ok": True, "counts": counts, "count": len(log), "requests": log})
+    elif not a.max:
+        console.print(f"[dim]{counts}[/dim]")
+    return log
+
+
+# --- downloads -------------------------------------------------------------
+def cmd_download(a):
+    """Arm downloads to a directory and wait for them to finish.
+
+    Headless Chrome drops downloads on the floor unless download behavior is set
+    on the session, so this arms it, optionally navigates, and waits.
+    """
+    outdir = os.path.abspath(os.path.expanduser(a.dir))
+    os.makedirs(outdir, exist_ok=True)
+    c, t = connect(a.host, a.port, a.target)
+    quiet = getattr(a, "json", False)
+    done, seen = [], {}
+    try:
+        c.call("Browser.setDownloadBehavior",
+               {"behavior": "allowAndName", "downloadPath": outdir, "eventsEnabled": True})
+        c.call("Page.enable")
+        if a.url:
+            c.call("Page.navigate", {"url": a.url})
+        if not quiet:
+            console.print(Panel(f"downloads → {outdir}  —  waiting up to {a.wait}s",
+                                border_style="cyan"))
+        deadline = time.time() + a.wait
+        while time.time() < deadline:
+            try:
+                m = c.q.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            if "__error__" in m:
+                break
+            method, p = m.get("method"), m.get("params", {})
+            if method == "Browser.downloadWillBegin":
+                seen[p["guid"]] = p.get("suggestedFilename", p["guid"])
+                if not quiet:
+                    console.print(f"[cyan]start[/cyan] {seen[p['guid']]}")
+            elif method == "Browser.downloadProgress" and p.get("state") in ("completed", "canceled"):
+                name = seen.get(p["guid"], p["guid"])
+                # allowAndName stores the file under its guid, not its display name
+                stored = os.path.join(outdir, p["guid"])
+                final = os.path.join(outdir, name)
+                if p["state"] == "completed" and os.path.exists(stored):
+                    try:
+                        os.replace(stored, final)
+                    except OSError:
+                        final = stored
+                done.append({"name": name, "state": p["state"],
+                             "path": final if p["state"] == "completed" else None,
+                             "bytes": int(p.get("receivedBytes") or 0)})
+                if not quiet:
+                    color = "green" if p["state"] == "completed" else "red"
+                    console.print(f"[{color}]{p['state']}[/{color}] {name}")
+                if not a.all:
+                    break
+    finally:
+        c.close()
+    if not done and not quiet:
+        console.print("[yellow]no downloads completed[/yellow] "
+                      "[dim](pass --url, or trigger one in the tab while this runs)[/dim]")
+    return emit(a, {"ok": bool(done), "dir": outdir, "count": len(done), "downloads": done},
+                lambda: None)
+
+
+# --------------------------------------------------------------------------
+# agent skill (teach a coding agent this CLI, wherever it is installed)
+# --------------------------------------------------------------------------
+SKILL_DEFAULT_DIR = os.path.expanduser("~/.claude/skills")
+
+
+def _command_table():
+    """The full command surface as a Markdown table, generated from the parser."""
+    lines = ["| command | usage | what |", "|---|---|---|"]
+    for r in _surface():
+        alias = f" ({'/'.join(r['aliases'])})" if r["aliases"] else ""
+        usage = " ".join(r["args"] + r["options"]).replace("|", "\\|")
+        lines.append(f"| `{r['command']}{alias}` | `{usage}` | {r['help']} |")
+    return "\n".join(lines)
+
+
+def _error_kind_list():
+    """The `error.kind` vocabulary as one inline Markdown line, from ERROR_KINDS."""
+    return ", ".join(f"`{k}`" for k in ERROR_KINDS if k != "error")
+
+
+def _skill_text():
+    """SKILL.md with the generated bits filled in, so they can never drift."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SKILL.md")
+    if not os.path.exists(path):
+        raise UserError("SKILL.md is missing from the installed package", "missing-dep")
+    with open(path) as f:
+        body = f.read()
+    return (body.replace("<!-- COMMANDS -->", _command_table())
+                .replace("<!-- ERROR-KINDS -->", _error_kind_list()))
+
+
+def cmd_skill(a):
+    """Print or install the agent skill.
+
+    AGENTS.md only helps inside this repo, but chromectl is installed globally —
+    so the docs have to ship with the binary and land where an agent will look.
+    """
+    text = _skill_text()
+    if a.action == "print":
+        print(text)
+        return text
+    root = os.path.expanduser(a.dir or SKILL_DEFAULT_DIR)
+    dest_dir = os.path.join(root, "chromectl")
+    dest = os.path.join(dest_dir, "SKILL.md")
+    if os.path.exists(dest) and not a.force:
+        raise UserError(f"{dest} already exists — pass --force to overwrite", "exists")
+    os.makedirs(dest_dir, exist_ok=True)
+    with open(dest, "w") as f:
+        f.write(text)
+
+    def render():
+        console.print(f"[green]installed[/green] skill → {dest}")
+        console.print("[dim]agents that read this directory will pick it up next session[/dim]")
+
+    return emit(a, {"ok": True, "path": dest, "chars": len(text)}, render)
 
 
 # --------------------------------------------------------------------------
@@ -2202,7 +3257,13 @@ def build_parser():
 
     sp = sub.add_parser("list", aliases=["ls"], parents=[jsonopt], help="list open targets (tabs)")
     sp.set_defaults(fn=cmd_list)
-    sp = sub.add_parser("start", help="launch a Chrome instance (headless by default)")
+    sp = sub.add_parser("start", parents=[jsonopt],
+                        help="launch a browser (headless by default) or any Electron app")
+    # `chromectl start --port N` is the spelling everyone reaches for, but --port is a
+    # global. SUPPRESS lets it be accepted here too without clobbering the global default.
+    sp.add_argument("--port", type=int, default=argparse.SUPPRESS,
+                    help="debug port to listen on (default 9222)")
+    sp.add_argument("--host", default=argparse.SUPPRESS, help="bind host (default localhost)")
     sp.add_argument("--name", help="label this instance (target later with -i NAME)")
     sp.add_argument("--auto-port", action="store_true", help="pick a free port instead of --port")
     sp.add_argument("--profile", help="user-data-dir (default: persistent ~/.chromectl/profiles/<name>)")
@@ -2210,6 +3271,11 @@ def build_parser():
                     help="use a throwaway profile in /tmp (no persistence) instead of the default")
     sp.add_argument("--headful", action="store_true", help="show the window")
     sp.add_argument("--binary", help="path to a Chrome/Chromium binary")
+    sp.add_argument("--app", metavar="PATH",
+                    help="launch any Electron-based app instead of Chrome (a name on PATH or a "
+                         "path); it keeps its own profile/login — no --user-data-dir is injected")
+    sp.add_argument("--wait", type=float, metavar="SECONDS",
+                    help="how long to wait for the debug port (default 12; 45 with --app)")
     sp.add_argument("--copy-profile", action="store_true",
                     help="copy your real Chrome profile (logins/cookies) into --profile first")
     sp.add_argument("--from-profile", metavar="PATH",
@@ -2233,48 +3299,67 @@ def build_parser():
     sp.add_argument("--prune", action="store_true", help="forget instances that are no longer up")
     sp.set_defaults(fn=cmd_instances)
 
-    sp = sub.add_parser("stop", help="stop a managed instance (by name/port) or --all")
+    sp = sub.add_parser("adopt", parents=[jsonopt],
+                        help="record an already-running browser/app on a debug port so -i NAME works")
+    sp.add_argument("port_arg", nargs="?", metavar="PORT", help="debug port (default: --port)")
+    sp.add_argument("--name", help="label this instance (default: from its user agent)")
+    sp.add_argument("--force", action="store_true", help="replace an existing entry of that name")
+    sp.set_defaults(fn=cmd_adopt)
+
+    sp = sub.add_parser("stop", parents=[jsonopt],
+                        help="stop a managed instance (by name/port) or --all")
     sp.add_argument("which", nargs="?", help="instance name or port")
     sp.add_argument("--all", action="store_true", help="stop every managed instance")
     sp.add_argument("--purge", action="store_true", help="also delete the instance's profile dir")
+    sp.add_argument("--forget", action="store_true",
+                    help="drop it from the registry without stopping the process")
+    sp.add_argument("--force", action="store_true",
+                    help="kill even an adopted instance (it is somebody's real app)")
     sp.set_defaults(fn=cmd_stop)
 
-    sp = sub.add_parser("version", help="browser + protocol version"); sp.set_defaults(fn=cmd_version)
+    sp = sub.add_parser("version", parents=[jsonopt], help="browser + protocol version"); sp.set_defaults(fn=cmd_version)
 
     sp = sub.add_parser("cheat", aliases=["commands"], parents=[jsonopt],
                         help="print the entire command surface in one call (agent-friendly)")
     sp.set_defaults(fn=cmd_cheat)
 
-    sp = sub.add_parser("open", help="open a new tab at URL")
+    sp = sub.add_parser("open", parents=[jsonopt], help="open a new tab at URL")
     sp.add_argument("url"); sp.set_defaults(fn=cmd_open)
 
-    sp = sub.add_parser("close", help="close a tab")
+    sp = sub.add_parser("close", parents=[jsonopt], help="close a tab")
     target_arg(sp, required=True); sp.set_defaults(fn=cmd_close)
 
-    sp = sub.add_parser("goto", aliases=["nav"], help="navigate a tab to URL")
+    sp = sub.add_parser("goto", aliases=["nav"], parents=[jsonopt], help="navigate a tab to URL")
     target_arg(sp); sp.add_argument("url"); sp.add_argument("--timeout", type=float, default=15)
     sp.set_defaults(fn=cmd_goto)
 
-    sp = sub.add_parser("eval", aliases=["js"], help="run JavaScript in a tab")
+    sp = sub.add_parser("eval", aliases=["js"], parents=[jsonopt], help="run JavaScript in a tab")
     target_arg(sp); sp.add_argument("js", nargs="+", help="JS expression")
     sp.set_defaults(fn=cmd_eval)
 
-    sp = sub.add_parser("html", help="dump a tab's HTML")
+    sp = sub.add_parser("html", parents=[jsonopt], help="dump a tab's HTML")
     target_arg(sp); sp.add_argument("--out"); sp.add_argument("--max", type=int, default=4000)
     sp.set_defaults(fn=cmd_html)
 
-    sp = sub.add_parser("text", help="dump a tab's visible text")
+    sp = sub.add_parser("text", parents=[jsonopt], help="dump a tab's visible text")
     target_arg(sp); sp.set_defaults(fn=cmd_text)
 
-    sp = sub.add_parser("cookies", parents=[jsonopt], help="list a tab's cookies")
+    sp = sub.add_parser("cookies", parents=[jsonopt], help="list, set, delete or clear cookies")
+    sp.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
+                    help="set a cookie (repeatable)")
+    sp.add_argument("--delete", action="append", default=[], metavar="NAME",
+                    help="delete a cookie by name (repeatable)")
+    sp.add_argument("--clear", action="store_true", help="clear ALL browser cookies")
+    sp.add_argument("--url", help="URL the cookie belongs to (default: the tab's)")
+    sp.add_argument("--domain", help="cookie domain (default: from --url)")
     target_arg(sp); sp.set_defaults(fn=cmd_cookies)
 
-    sp = sub.add_parser("screenshot", aliases=["shot"], help="capture a screenshot")
+    sp = sub.add_parser("screenshot", aliases=["shot"], parents=[jsonopt], help="capture a screenshot")
     target_arg(sp); sp.add_argument("--out"); sp.add_argument("--full", action="store_true",
                                                               help="full-page (beyond viewport)")
     sp.set_defaults(fn=cmd_screenshot)
 
-    sp = sub.add_parser("pdf", help="print a tab to PDF")
+    sp = sub.add_parser("pdf", parents=[jsonopt], help="print a tab to PDF")
     target_arg(sp); sp.add_argument("--out"); sp.set_defaults(fn=cmd_pdf)
 
     def loc_args(sp):
@@ -2335,22 +3420,22 @@ def build_parser():
     sp.add_argument("--out", help="save the full JSON report")
     sp.set_defaults(fn=cmd_lighthouse)
 
-    sp = sub.add_parser("snapshot", aliases=["snap"], help="list interactive elements (Playwright); saves refs")
-    target_arg(sp); sp.add_argument("--out", help=f"snapshot file (default {SNAP_FILE})")
+    sp = sub.add_parser("snapshot", aliases=["snap"], parents=[jsonopt], help="list interactive elements (Playwright); saves refs")
+    target_arg(sp); sp.add_argument("--out", help="write refs here (default ~/.chromectl/snaps/<host>-<port>.json)")
     sp.set_defaults(fn=cmd_snapshot)
 
-    sp = sub.add_parser("click", help="click an element (Playwright auto-wait)")
+    sp = sub.add_parser("click", parents=[jsonopt], help="click an element (Playwright auto-wait)")
     target_arg(sp); loc_args(sp); sp.set_defaults(fn=cmd_click)
 
-    sp = sub.add_parser("fill", help="fill an input/textarea (Playwright)")
+    sp = sub.add_parser("fill", parents=[jsonopt], help="fill an input/textarea (Playwright)")
     target_arg(sp, required=True); sp.add_argument("value", nargs="+"); loc_args(sp)
     sp.add_argument("--enter", action="store_true", help="press Enter after")
     sp.set_defaults(fn=cmd_fill)
 
-    sp = sub.add_parser("hover", help="hover an element (Playwright)")
+    sp = sub.add_parser("hover", parents=[jsonopt], help="hover an element (Playwright)")
     target_arg(sp); loc_args(sp); sp.set_defaults(fn=cmd_hover)
 
-    sp = sub.add_parser("emulate", help="device/geo/network/color-scheme/UA emulation")
+    sp = sub.add_parser("emulate", parents=[jsonopt], help="device/geo/network/color-scheme/UA emulation")
     target_arg(sp)
     sp.add_argument("--width", type=int); sp.add_argument("--height", type=int)
     sp.add_argument("--scale", type=float, default=1); sp.add_argument("--mobile", action="store_true")
@@ -2363,24 +3448,24 @@ def build_parser():
     sp.add_argument("--clear", action="store_true", help="clear all overrides")
     sp.set_defaults(fn=cmd_emulate)
 
-    sp = sub.add_parser("resize", help="set viewport size (device metrics)")
+    sp = sub.add_parser("resize", parents=[jsonopt], help="set viewport size (device metrics)")
     target_arg(sp); sp.add_argument("width", type=int); sp.add_argument("height", type=int)
     sp.add_argument("--scale", type=float, default=1); sp.add_argument("--mobile", action="store_true")
     sp.add_argument("--shot", metavar="PATH"); sp.add_argument("--hold", action="store_true")
     sp.set_defaults(fn=cmd_resize)
 
-    sp = sub.add_parser("press", help="press key(s): Enter, Tab, ArrowDown, a, …")
+    sp = sub.add_parser("press", parents=[jsonopt], help="press key(s): Enter, Tab, ArrowDown, a, …")
     target_arg(sp, required=True); sp.add_argument("keys", nargs="+")
     sp.add_argument("--selector", help="focus this CSS selector first")
     sp.set_defaults(fn=cmd_press)
 
-    sp = sub.add_parser("type", help="type text into the focused (or --selector) element")
+    sp = sub.add_parser("type", parents=[jsonopt], help="type text into the focused (or --selector) element")
     target_arg(sp, required=True); sp.add_argument("text", nargs="+")
     sp.add_argument("--selector", help="focus this CSS selector first")
     sp.add_argument("--enter", action="store_true", help="press Enter after")
     sp.set_defaults(fn=cmd_type)
 
-    sp = sub.add_parser("upload", help="set files on a file <input>")
+    sp = sub.add_parser("upload", parents=[jsonopt], help="set files on a file <input>")
     target_arg(sp, required=True); sp.add_argument("--selector", required=True, help="CSS selector of the file input")
     sp.add_argument("files", nargs="+", help="local file path(s)")
     sp.set_defaults(fn=cmd_upload)
@@ -2394,15 +3479,86 @@ def build_parser():
     sp.add_argument("--max", type=float, default=0, help="stop after N seconds (0 = until Ctrl-C)")
     sp.set_defaults(fn=cmd_dialog)
 
-    sp = sub.add_parser("heapsnapshot", aliases=["heap"], help="capture a V8 heap snapshot")
+    sp = sub.add_parser("heapsnapshot", aliases=["heap"], parents=[jsonopt], help="capture a V8 heap snapshot")
     target_arg(sp); sp.add_argument("--out"); sp.set_defaults(fn=cmd_heapsnapshot)
 
-    sp = sub.add_parser("run", help="run a sequence of steps in one process (script/batch)")
+    sp = sub.add_parser("run", parents=[jsonopt], help="run a sequence of steps in one process (script/batch)")
     sp.add_argument("file", nargs="?", help="steps file, or '-'/omitted = stdin")
     sp.add_argument("--step", action="append", metavar="CMD", help="a step (repeatable), instead of a file")
     sp.add_argument("--target", default="", help="default target for steps that omit one")
     sp.add_argument("--keep-going", action="store_true", help="continue after a failing step")
     sp.set_defaults(fn=cmd_run)
+
+    sp = sub.add_parser("back", parents=[jsonopt], help="go back in history")
+    target_arg(sp); sp.set_defaults(fn=cmd_back)
+
+    sp = sub.add_parser("forward", parents=[jsonopt], help="go forward in history")
+    target_arg(sp); sp.set_defaults(fn=cmd_forward)
+
+    sp = sub.add_parser("reload", parents=[jsonopt], help="reload a tab")
+    target_arg(sp)
+    sp.add_argument("--hard", action="store_true", help="bypass the cache")
+    sp.add_argument("--timeout", type=float, default=15, help="seconds to await load")
+    sp.set_defaults(fn=cmd_reload)
+
+    sp = sub.add_parser("storage", parents=[jsonopt],
+                        help="read/write localStorage or sessionStorage")
+    target_arg(sp)
+    sp.add_argument("--session", action="store_true", help="sessionStorage instead of localStorage")
+    sp.add_argument("--get", metavar="KEY", help="read one key")
+    sp.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="set a key (repeatable)")
+    sp.add_argument("--remove", action="append", default=[], metavar="KEY",
+                    help="remove a key (repeatable)")
+    sp.add_argument("--clear", action="store_true", help="clear the whole area")
+    sp.set_defaults(fn=cmd_storage)
+
+    sp = sub.add_parser("auth", parents=[jsonopt],
+                        help="save/load a login (cookies + per-origin web storage)")
+    sp.add_argument("action", choices=["save", "load"])
+    sp.add_argument("file", help="storage-state JSON file")
+    sp.add_argument("--origin", action="append", default=[], metavar="URL",
+                    help="save: limit web storage to these origins (repeatable)")
+    sp.add_argument("--keep-tabs", action="store_true",
+                    help="load: leave the tabs opened to restore each origin")
+    sp.set_defaults(fn=cmd_auth)
+
+    sp = sub.add_parser("a11y", aliases=["ax"], parents=[jsonopt],
+                        help="dump the accessibility tree (roles + names)")
+    target_arg(sp)
+    sp.add_argument("--all", action="store_true", help="include generic/presentational nodes")
+    sp.add_argument("--max", type=int, default=0, help="cap the number of nodes")
+    sp.set_defaults(fn=cmd_a11y)
+
+    sp = sub.add_parser("intercept", parents=[jsonopt],
+                        help="block, stub or rewrite requests (holds session)")
+    target_arg(sp)
+    sp.add_argument("--block", action="append", default=[], metavar="PATTERN",
+                    help="fail requests matching this glob/substring (repeatable)")
+    sp.add_argument("--stub", action="append", default=[], metavar="PATTERN=FILE",
+                    help="serve FILE for requests matching PATTERN (repeatable)")
+    sp.add_argument("--header", action="append", default=[], metavar="'Name: value'",
+                    help="add a request header to everything (repeatable)")
+    sp.add_argument("--status", type=int, default=200, help="status code for --stub")
+    sp.add_argument("--content-type", default="application/json", help="content-type for --stub")
+    sp.add_argument("--max", type=float, default=0, help="stop after N seconds (0 = until Ctrl-C)")
+    sp.set_defaults(fn=cmd_intercept)
+
+    sp = sub.add_parser("download", parents=[jsonopt],
+                        help="arm downloads to a directory and wait")
+    target_arg(sp)
+    sp.add_argument("--dir", default="./downloads", help="where files land (default ./downloads)")
+    sp.add_argument("--url", help="navigate the tab here after arming")
+    sp.add_argument("--wait", type=float, default=30, help="seconds to wait (default 30)")
+    sp.add_argument("--all", action="store_true", help="keep waiting for more than one file")
+    sp.set_defaults(fn=cmd_download)
+
+    sp = sub.add_parser("skill", parents=[jsonopt],
+                        help="print or install the agent skill for this CLI")
+    sp.add_argument("action", nargs="?", default="print", choices=["print", "install"])
+    sp.add_argument("--dir", help=f"install root (default {SKILL_DEFAULT_DIR})")
+    sp.add_argument("--force", action="store_true", help="overwrite an existing skill")
+    sp.set_defaults(fn=cmd_skill)
 
     sp = sub.add_parser("raw", aliases=["cmd"], help="send a raw CDP command")
     target_arg(sp); sp.add_argument("method"); sp.add_argument("params", nargs="?",
@@ -2416,10 +3572,12 @@ def build_parser():
     sp.add_argument("query", nargs="?", help="Domain | Domain.command | Domain.event")
     sp.set_defaults(fn=cmd_proto)
 
-    sp = sub.add_parser("watch", help="live-tail network requests of a tab")
-    target_arg(sp); sp.set_defaults(fn=cmd_watch)
+    sp = sub.add_parser("watch", parents=[jsonopt], help="live-tail network requests of a tab")
+    target_arg(sp); sp.add_argument("--max", type=float, default=0,
+                                    help="stop after N seconds (0 = until Ctrl-C)")
+    sp.set_defaults(fn=cmd_watch)
 
-    sp = sub.add_parser("console", aliases=["logs"], help="tail console messages + JS errors")
+    sp = sub.add_parser("console", aliases=["logs"], parents=[jsonopt], help="tail console messages + JS errors")
     target_arg(sp); sp.add_argument("--max", type=float, default=0,
                                     help="stop after N seconds (0 = until Ctrl-C)")
     sp.set_defaults(fn=cmd_console)
@@ -2429,7 +3587,8 @@ def build_parser():
                     help="a URL (opens+audits+closes) OR a target selector for a loaded tab")
     sp.set_defaults(fn=cmd_seo)
 
-    sp = sub.add_parser("capture", help="Burp-style full request/response capture")
+    sp = sub.add_parser("capture", parents=[jsonopt],
+                        help="Burp-style full request/response capture")
     sp.add_argument("url", nargs="?", help="URL to open+capture (omit with --attach)")
     sp.add_argument("--attach", metavar="TARGET", help="capture an existing tab instead of opening one")
     sp.add_argument("--reload", action="store_true", help="with --attach: reload to capture from start")
@@ -2445,25 +3604,38 @@ def build_parser():
     return p
 
 
+def die(args, kind, message, hint=""):
+    """Report a fatal error the way the caller asked for it, then exit 1.
+
+    With --json the error is a JSON object on stdout, so an agent parsing stdout
+    gets a value either way instead of an empty string plus red prose on stderr.
+    """
+    if getattr(args, "json", False):
+        out_json({"ok": False, "error": {"kind": kind, "message": str(message)}})
+    else:
+        err.print(f"{kind}: {message}" + (f"\n{hint}" if hint else ""))
+    sys.exit(1)
+
+
 def main():
     args = build_parser().parse_args()
     if getattr(args, "instance", None):        # -i NAME → that instance's host/port
         inst = _find_instance(args.instance)
         if not inst:
-            err.print(f"no managed instance {args.instance!r} (see: chromectl instances)")
-            sys.exit(1)
+            die(args, "no-instance",
+                f"no managed instance {args.instance!r} (see: chromectl instances)")
         args.host, args.port = inst.get("host", args.host), inst.get("port", args.port)
     if args.cmd == "capture" and not args.url and not args.attach:
-        err.print("capture needs a URL or --attach TARGET")
-        sys.exit(1)
+        die(args, "bad-args", "capture needs a URL or --attach TARGET")
     try:
         args.fn(args)
+    except UserError as e:
+        die(args, e.kind, e)
     except (ConnectionError, OSError) as e:
-        err.print(f"connection error: {e}\n(is Chrome running with --remote-debugging-port={args.port}?)")
-        sys.exit(1)
+        die(args, "connection", e,
+            f"(is Chrome running with --remote-debugging-port={args.port}?)")
     except (CDPError, TimeoutError) as e:
-        err.print(f"cdp error: {e}")
-        sys.exit(1)
+        die(args, "cdp", e)
     except KeyboardInterrupt:
         sys.exit(130)
 

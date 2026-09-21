@@ -27,7 +27,7 @@ pipx puts `chromectl` on your PATH in an isolated env and pulls all Python deps
 over CDP rather than launching their own browser. Playwright and the read/markdown
 libs are imported lazily, so the core commands stay fast.
 
-## 1. Launch Chrome
+## 1. Launch a browser
 
 ```bash
 chromectl start                                   # headless, port 9222, PERSISTENT profile
@@ -38,6 +38,7 @@ chromectl start --copy-profile                    # copy your REAL Chrome profil
 chromectl start --from-profile /path/to/profile   # copy from a specific profile dir
 chromectl start --proxy user:pass@10.0.0.1:8080   # behind a proxy (credentials handled)
 chromectl start -- --lang=tr --disable-gpu        # pass any extra Chrome flags
+chromectl start --app slack                      # any Electron app (see below)
 ```
 
 ### Extra Chrome flags
@@ -116,6 +117,54 @@ Notes:
 - Anyone who can reach the port has **full, unauthenticated control** of that browser
   (read cookies/sessions, run JS, read traffic). Keep it on localhost; never forward it.
 
+### Electron apps (any of them)
+
+Slack, Discord, VS Code, Obsidian, Signal, Telegram Desktop — an Electron app *is*
+Chromium, so once it is listening the whole CLI works against it. There is no list of
+supported apps in the code: you point `--app` at any executable.
+
+```bash
+chromectl start --app slack --name slack       # a name on PATH, or a full path
+chromectl start --app /opt/Discord/Discord --name discord --auto-port
+chromectl -i slack list                        # its windows
+chromectl -i slack read --json                 # same commands as any browser
+chromectl -i slack capture --attach slack --max 20   # what it sends over the wire
+```
+
+Already launched it yourself? Record the port instead, and `-i NAME` works the same:
+
+```bash
+slack --remote-debugging-port=9222 &
+chromectl adopt 9222 --name slack
+```
+
+Four things to know:
+
+- **It keeps its own profile.** chromectl passes an app **only**
+  `--remote-debugging-port` — never `--user-data-dir`, which would hand you a
+  signed-out app and defeat the point. Pass `--profile DIR` or `--ephemeral` to opt
+  into an isolated one.
+- **Quit it first.** Electron's single-instance lock forwards a second launch to the
+  process already running and silently drops our flags. `start` notices, fails with
+  `launch-failed`, and prints the app's own output so you can see what it said.
+- **No tab model.** `Target.createTarget` is unimplemented in Electron, so `open` and
+  `close` fail — with the app's own words ("Not supported"), not ours. Everything that
+  drives an *existing* window is fine: `goto`, `eval`, `read`, `console`, `intercept`,
+  `snapshot`/`click`/`fill`, `a11y`, `storage`, `cookies`, plus `perf --attach`,
+  `capture --attach`, and `seo <target>` instead of `seo <url>`. App windows show up as
+  `page` **or** `webview` targets; `chromectl list` shows both.
+- **This is your real session.** A debug port on Slack is far more dangerous than one on
+  a throwaway browser — anyone who reaches it can read every message and act as you.
+  Keep it on localhost, and stop the instance when you're done. For the same reason
+  `chromectl stop` **refuses** to kill an instance it did not start: use
+  `stop NAME --forget` to drop the record, or `--force` to insist.
+
+If a WebSocket connection is refused, add `--chrome-arg --remote-allow-origins='*'`.
+
+**Not in scope:** Microsoft Teams and other [WebView2](https://learn.microsoft.com/en-us/microsoft-edge/webview2/how-to/remote-debugging-desktop)
+apps are Edge-embedded rather than Electron, and need a Windows env var or registry key
+rather than a flag. On Linux, Teams is a PWA that the ordinary Chrome path already covers.
+
 ## 2. Use it
 
 ```bash
@@ -163,7 +212,7 @@ chromectl wait example --selector "#results" --timeout 8000   # wait until it's 
 chromectl wait example --network-idle                          # or: --text "Done" / --url "/checkout" / --gone
 chromectl fill-form login --set "#user=ada" --set "#pass=secret" --submit "#go"
 
-# Most read-only commands accept --json for scripting/agents:
+# EVERY command accepts --json — one plain JSON value on stdout:
 chromectl list --json ; chromectl cookies example --json ; chromectl seo example --json
 
 # --- performance (Tier 3) ---
@@ -191,6 +240,28 @@ chromectl upload example ./photo.png --selector "#file"   # set a file <input>
 chromectl dialog example --accept --text "Ada"            # auto-answer alert/confirm/prompt
 chromectl heap example --out heap.heapsnapshot            # V8 heap snapshot (DevTools ▸ Memory)
 
+# --- navigation & state ---
+chromectl back example ; chromectl forward example ; chromectl reload example --hard
+chromectl storage example --json                          # localStorage (--session for sessionStorage)
+chromectl storage example --set token=abc --json          # …and write it
+chromectl cookies example --set 'sid=abc' --json          # cookies are writable too (--delete, --clear)
+chromectl auth save session.json                          # cookies + per-origin web storage
+chromectl auth load session.json                          # replay that login into any instance
+
+# --- accessibility & interception ---
+chromectl a11y example --json                             # the tree a screen reader sees
+chromectl intercept example --block '*doubleclick*' --max 10      # block requests
+chromectl intercept example --stub '*/api/me=fake.json' --max 10  # serve a fixed body
+chromectl intercept example --header 'X-Test: 1' --max 10         # add a request header
+chromectl download example --url https://site/a.pdf --dir ./out   # headless downloads need arming
+
+# --- electron apps ---
+chromectl start --app slack --name slack              # launch any Electron app
+chromectl adopt 9222 --name slack                     # or adopt one already listening
+chromectl -i slack goto slack https://app.slack.com/  # `open` has no meaning: no tabs
+chromectl stop slack --forget                         # drop the record, leave it running
+
+chromectl skill install                               # teach a coding agent this CLI
 chromectl raw browser Browser.getVersion              # raw CDP command (browser target)
 chromectl raw example Runtime.evaluate '{"expression":"1+1","returnByValue":true}'
 chromectl proto Network                               # protocol lookup: a domain…
@@ -214,10 +285,63 @@ the connection open (Ctrl-C to release) so the override persists while you do ot
 `snapshot`/`click`/`fill`/`hover` use **Playwright attached to your Chrome over CDP**
 (`connect_over_cdp`) — no separate browser is launched. You get Playwright's
 auto-waiting and actionability checks (waits for the element to exist, be visible, and
-be stable before acting) instead of hand-rolled timing. `snapshot` writes `.cdp-snap.json`
-so `--ref N` works in a later, separate command (the stateless equivalent of the MCP's
-element uids). Locate an element by any of: `--ref`, `--selector`, `--text`, or
-`--role`+`--name`.
+be stable before acting) instead of hand-rolled timing. `snapshot` saves its refs to
+`~/.chromectl/snaps/<host>-<port>.json` so `--ref N` works in a later, separate command
+(the stateless equivalent of the MCP's element uids) — per instance, so two browsers
+never clobber each other's refs, and never in your working directory. `snapshot --json`
+returns the same elements inline. Locate an element by any of: `--ref`, `--selector`,
+`--text`, or `--role`+`--name`.
+
+### `--json` everywhere (the agent contract)
+
+Every command takes `--json` and prints exactly one JSON value on stdout. **Failures
+do too** — `{"ok": false, "error": {"kind": "timeout", "message": "…"}}`, still with a
+non-zero exit — so a script that parses stdout always gets a value instead of an empty
+string plus red prose on stderr. `kind` is one of `bad-args`, `no-instance`, `no-target`, `not-found`, `exists`, `timeout`, `js-exception`, `no-snapshot`, `no-history`, `no-storage`, `close-failed`, `launch-failed`, `missing-dep`, `tool-failed`, `connection`, `cdp`.
+
+`run --json` runs every step in its own JSON mode and returns the whole batch:
+
+```console
+$ chromectl run --json --step 'open https://site' --step 'wait --selector #nope --timeout 800'
+{
+  "ok": false, "steps": 2, "failed": 1,
+  "results": [
+    {"step": 1, "cmd": "open https://site", "ok": true,
+     "result": {"ok": true, "id": "AE21…", "url": "https://site"}},
+    {"step": 2, "cmd": "wait --selector #nope --timeout 800", "ok": false,
+     "error": {"kind": "timeout", "message": "timeout waiting for selector '#nope'"}}
+  ]
+}
+```
+
+`watch`, `console` and `intercept` stream until interrupted — pass `--max SECONDS` to
+bound them, and under `--json` they hand back one array at the end.
+
+### Reusing a login (`auth`)
+
+```bash
+chromectl auth save session.json    # cookies (browser-wide) + per-origin localStorage/sessionStorage
+chromectl start --name fresh --ephemeral
+chromectl -i fresh auth load session.json
+```
+
+Log in once, replay everywhere — including into a throwaway instance. The file is
+written mode 600 and **is a live session**: treat it like a password. This is the
+narrow, safer alternative to `--copy-profile`, which clones your whole real profile.
+
+### For coding agents (`skill`)
+
+`AGENTS.md` only helps inside this repo, but chromectl is installed globally — so the
+docs ship with the binary:
+
+```bash
+chromectl skill install           # → ~/.claude/skills/chromectl/SKILL.md
+chromectl skill install --dir .   # → ./chromectl/SKILL.md, for any agent harness
+chromectl skill print             # to stdout
+```
+
+The command table inside the skill is generated from the argument parser at install
+time, so it cannot drift from the real surface.
 
 ### Handy options
 - `--host` / `--port` (or env `CDP_HOST` / `CDP_PORT`) — default `localhost:9222`.
@@ -240,12 +364,28 @@ the capture/console/watch loops (event streams) share one connection cleanly.
 modern Chrome rejects on the debug port. `chromectl` sets `suppress_origin=True` so
 connections are accepted without relaunching Chrome.
 
+## Tests
+
+```bash
+python -m venv .venv && .venv/bin/pip install -e ".[test]"
+.venv/bin/pytest                 # unit tests + browser-driven integration tests
+.venv/bin/pytest tests/test_unit.py   # just the ones that need no browser
+```
+
+The integration tests start and stop their own headless Chrome on a free port with a
+throwaway profile, and serve fixtures from `tests/fixtures` over a local HTTP server —
+they never touch your own instances. They skip cleanly when no Chrome is on PATH.
+
 ## Layout
 - `chromectl/cli.py` — the CLI.
+- `chromectl/SKILL.md` — the agent skill, installed by `chromectl skill install`.
 - `chromectl/protocol.json` — bundled CDP schema used by `chromectl proto`/`cheat` (falls back to live).
+- `chromectl/proxyrelay.py` — the local relay that adds proxy credentials upstream.
+- `tests/` — pytest suite (`test_unit.py` needs no browser; `test_cli.py` drives a real one).
 - `pyproject.toml` — packaging; `chromectl` console entry point.
 - `AGENTS.md` — the agent-facing interface reference (auto-read by coding agents).
 
 ## For agents
-Read `AGENTS.md` (or run `chromectl cheat --json` once) for the full command surface —
-no need to call `--help` per command.
+Run `chromectl skill install` once — that drops a skill where coding agents look, so
+they learn this CLI in any project, not just this repo. Inside this repo, `AGENTS.md`
+is the same reference; `chromectl cheat --json` returns the surface as data.

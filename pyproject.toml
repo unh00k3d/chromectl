@@ -38,7 +38,8 @@ dependencies = [
 
 [project.optional-dependencies]
 # `lighthouse` command also needs the Node CLI:  npm i -g lighthouse
-dev = ["build", "twine", "pipx"]
+dev = ["build", "twine", "pipx", "pytest>=7"]
+test = ["pytest>=7"]
 
 [project.urls]
 Homepage = "https://github.com/unh00k3d/chromectl"
@@ -52,4 +53,10 @@ chromectl = "chromectl.cli:main"
 packages = ["chromectl"]
 
 [tool.setuptools.package-data]
-chromectl = ["protocol.json"]
+chromectl = ["protocol.json", "SKILL.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# the browser-driven tests start and stop their own headless Chrome; they skip
+# cleanly when no Chrome is on PATH, so a bare `pytest` is always safe to run
+addopts = "-q"

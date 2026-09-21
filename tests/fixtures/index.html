@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>chromectl fixture</title>
+  <meta name="description" content="A fixture page for the chromectl test suite.">
+</head>
+<body>
+  <h1>Hello fixture</h1>
+  <p class="price" data-sku="a1">9.99</p>
+  <p class="price" data-sku="b2">19.99</p>
+  <img src="pixel.png" alt="a pixel">
+  <a href="/page2.html" id="next">next page</a>
+  <a href="https://example.com/out" id="away">external link</a>
+  <div id="res">idle</div>
+  <button id="go" type="button">Go</button>
+  <script>
+    document.getElementById('go').addEventListener('click', () => {
+      document.getElementById('res').textContent = 'clicked';
+    });
+    localStorage.setItem('seeded', 'yes');
+    console.log('fixture ready');
+  </script>
+</body>
+</html>
