@@ -139,6 +139,36 @@ Downloads need arming — headless Chrome discards them otherwise:
 chromectl download --url https://site/report.pdf --dir ./out --wait 30 --json
 ```
 
+## Replaying requests (for authorized testing)
+
+`replay` re-sends a request — captured here or imported from Burp/curl/HAR —
+optionally tampered, so you can probe one target you're allowed to test:
+
+```bash
+chromectl replay --burp req.txt                     # raw HTTP/1.1 file (Burp "Copy to file"); - reads stdin
+chromectl replay --curl req.sh                       # a "Copy as cURL" command
+chromectl replay --har cap.har --index 3             # an entry from any HAR (incl. `capture --har`)
+chromectl replay --burp req.txt --set-header 'X-Role: admin' --method PUT   # tamper before sending
+```
+
+Two engines. **`raw`** (default without `--attach`) sends out-of-band with full
+header control and does not follow redirects, so you see the 3xx — true
+Burp-Repeater semantics. **`fetch`** (default with `--attach`) runs the request
+inside a live tab via `fetch()`, carrying that tab's real session; the browser
+strips forbidden headers (`Cookie`, `Host`, `Origin`, …) and can't read a
+redirect, both of which `replay` reports rather than hiding.
+
+Swap identities to test access control (raw engine). `--as` sends with cookies
+from an `auth save` file; `--vs` sends a second time as another identity and
+diffs the two responses — an identical body across identities is a
+broken-access-control (IDOR/BOLA) signal:
+
+```bash
+chromectl replay --burp req.txt --as alice.json                 # send as one user
+chromectl replay --burp req.txt --as alice.json --vs bob.json   # diff two users
+chromectl replay --har cap.har --diff                           # diff replay vs the stored response
+```
+
 ## Teaching another agent this CLI
 
 ```bash
@@ -149,6 +179,28 @@ chromectl skill print            # stdout
 
 The skill's command table is generated from the parser at install time, so it can
 never drift from the real surface.
+
+## Daemon (warm connections for many calls)
+
+```bash
+chromectl daemon start                 # resident process holding warm CDP connections
+chromectl daemon status --json         # up? how many pooled connections, uptime
+chromectl --daemon eval t "1+1"        # route ONE command through it (or CHROMECTL_DAEMON=1)
+chromectl daemon stop
+```
+
+The daemon runs the same command dispatch as the CLI over one long-lived
+process, keeping the connection pool warm between requests. **It is not a
+speed-up for one-shot shell calls** — a `chromectl …` invocation still boots
+Python (~100ms) before it can even talk to the daemon, so `--daemon` there is
+marginally *slower*. The win is for a **resident client**: a process that
+connects once and issues many commands pays the boot exactly once — ~14ms per
+command vs ~100ms cold (~7× faster). Streaming/interactive and
+process-management commands (`watch`, `console`, `intercept`, `capture`,
+`dialog`, `repl`, `run`, `start`, `stop`, `download`, `heapsnapshot`) always run
+locally, never through the daemon. The socket is a user-only Unix socket at
+`~/.chromectl/daemon.sock` speaking one-JSON-object-per-line — the same seam an
+agent can hold open to drive Chrome as a live stream.
 
 ## All commands
 
@@ -205,3 +257,5 @@ never drift from the real surface.
 | `console (logs)` | `[target] --json --max MAX` | tail console messages + JS errors |
 | `seo` | `[target] --json` | on-page SEO audit of a tab or URL |
 | `capture` | `[url] --json --attach TARGET --reload --type TYPE --print PRINT --out OUT --har HAR --no-bodies --bodycap BODYCAP --max MAX --quiet QUIET` | Burp-style full request/response capture |
+| `replay` | `[target] --json --burp FILE --curl FILE --har FILE --index INDEX --scheme {http,https} --method METHOD --url URL --set-header 'Name: value' --remove-header NAME --body BODY --body-file FILE --as SESSION.json --vs SESSION.json --diff --engine {auto,raw,fetch} --attach TARGET --timeout TIMEOUT --out FILE --bodycap BODYCAP` | re-send a captured/imported request (Burp/curl/HAR), tampered, through the live session or out-of-band |
+| `daemon` | `[action] --json --foreground` | run a resident process holding warm CDP connections |

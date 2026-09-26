@@ -332,3 +332,61 @@ def test_skill_has_no_unfilled_placeholders():
     text = cli._skill_text()
     assert "<!--" not in text, "a generated placeholder was left unsubstituted"
     assert "`launch-failed`" in text, "the kind list should come from ERROR_KINDS"
+
+
+# --- daemon (no browser needed: exercises protocol + dispatch capture) -----
+def test_daemon_lifecycle_protocol_and_routing(tmp_path, monkeypatch):
+    """Start the server in-process, then ping/status/route/shutdown over the socket.
+
+    No Chrome: routing a command that can't reach a browser must come back as the
+    same JSON error envelope the CLI produces, proving dispatch runs identically
+    inside the daemon."""
+    import contextlib
+    import io
+    import threading
+    import time
+
+    from chromectl import daemon as d
+
+    monkeypatch.setattr(d, "_DIR", str(tmp_path))
+    monkeypatch.setattr(d, "SOCK", str(tmp_path / "daemon.sock"))
+    monkeypatch.setattr(d, "PIDFILE", str(tmp_path / "daemon.pid"))
+
+    assert d.is_running() is False
+    threading.Thread(target=d.serve, daemon=True).start()
+    for _ in range(60):
+        if d.is_running():
+            break
+        time.sleep(0.05)
+    assert d.is_running(), "daemon never came up"
+
+    st = d.status()
+    assert st["running"] and st["pooled"] == 0 and "uptime" in st
+
+    # a command that reaches no browser -> connection error, exit 1, JSON on stdout
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = d.route(["--port", "1", "version", "--json"])
+    assert code == 1
+    obj = json.loads(buf.getvalue())
+    assert obj["ok"] is False and obj["error"]["kind"] == "connection"
+
+    # a routable command that needs no browser succeeds through the daemon
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = d.route(["cheat", "--json"])
+    assert code == 0 and "replay" in buf.getvalue()
+
+    assert d.stop() is True
+    for _ in range(60):
+        if not d.is_running():
+            break
+        time.sleep(0.05)
+    assert d.is_running() is False
+    assert cli._RUN_ACTIVE is False, "daemon must not leak pooling after shutdown"
+
+
+def test_streaming_commands_are_not_routable():
+    from chromectl import daemon as d
+    for cmd in ("watch", "console", "intercept", "capture", "dialog", "repl", "run", "start"):
+        assert cmd in d.NON_ROUTABLE

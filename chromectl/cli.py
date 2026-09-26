@@ -26,25 +26,48 @@ import io
 import json
 import os
 import queue
-import shlex
 import sys
 import threading
 import time
-from urllib.error import HTTPError
 from urllib.parse import urlsplit
-from urllib.request import urlopen, Request
 
 import websocket  # websocket-client
-from rich.console import Console
-from rich.table import Table
-from rich.json import JSON
-from rich.panel import Panel
-from rich.rule import Rule
-from rich.syntax import Syntax
-from rich.text import Text
 
-console = Console()
-err = Console(stderr=True, style="red")
+# Lazy rich. Importing rich costs ~30-40ms and is only ever needed to render for
+# a human. Agents run with --json and never touch it, so we defer every rich
+# import until something actually prints. `console`/`err` are proxies that build
+# the real Console on first use; the display classes are self-replacing shims
+# (each is used only as a constructor, so this needs no call-site changes).
+class _LazyConsole:
+    def __init__(self, **kw):
+        self._kw = kw
+        self._real = None
+
+    def __getattr__(self, name):
+        if self._real is None:
+            from rich.console import Console
+            self._real = Console(**self._kw)
+        return getattr(self._real, name)
+
+
+console = _LazyConsole()
+err = _LazyConsole(stderr=True, style="red")
+
+
+def _rich_shim(name, module):
+    def shim(*args, **kwargs):
+        import importlib
+        obj = getattr(importlib.import_module(module), name)
+        globals()[name] = obj          # swap the shim out; later calls are direct
+        return obj(*args, **kwargs)
+    return shim
+
+
+Table = _rich_shim("Table", "rich.table")
+JSON = _rich_shim("JSON", "rich.json")
+Panel = _rich_shim("Panel", "rich.panel")
+Rule = _rich_shim("Rule", "rich.rule")
+Syntax = _rich_shim("Syntax", "rich.syntax")
 
 
 def out_json(obj):
@@ -106,21 +129,80 @@ def emit(a, payload, render=None):
 # HTTP discovery endpoints
 # --------------------------------------------------------------------------
 def _http(host, port, path, method="GET"):
-    url = f"http://{host}:{port}{path}"
-    try:
-        with urlopen(Request(url, method=method), timeout=10) as r:
-            body = r.read().decode()
-    except HTTPError as e:
-        # The endpoint's real complaint is in the *body* — "Not supported",
-        # "No such target id", and so on. urllib's str() throws it away and
-        # leaves you with a bare "HTTP Error 500", so read it back out and
-        # pass the browser's own words through to the caller.
+    # The debug endpoints are plain HTTP on localhost returning tiny JSON, so we
+    # speak the protocol over a raw socket rather than importing urllib.request
+    # — which drags in ssl+email+http.client and costs ~40ms at import, the
+    # single biggest chunk of our boot. socket is already loaded (websocket uses
+    # it), so this is nearly free. On >=400 we pass the body through as the error
+    # detail, exactly as before ("No such target id", "Not supported", …).
+    import socket
+    req = (f"{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+           f"Accept: */*\r\n\r\n").encode()
+    with socket.create_connection((host, port), timeout=10) as s:
+        s.sendall(req)
+        buf = bytearray()
+        # 1) read until the header block is complete
+        while b"\r\n\r\n" not in buf:
+            b = s.recv(65536)
+            if not b:
+                break
+            buf += b
+        head, _, body = bytes(buf).partition(b"\r\n\r\n")
+        lines = head.split(b"\r\n")
+        headers = {}
+        for l in lines[1:]:
+            k, _, v = l.partition(b":")
+            headers[k.strip().lower()] = v.strip()
+        # 2) read the rest of the body: Content-Length, chunked, or to-EOF
+        clen = headers.get(b"content-length")
+        chunked = headers.get(b"transfer-encoding", b"").lower() == b"chunked"
+        body = bytearray(body)
+        if clen is not None:
+            need = int(clen)
+            while len(body) < need:
+                b = s.recv(65536)
+                if not b:
+                    break
+                body += b
+            body = body[:need]
+        elif chunked:
+            while not body.rstrip().endswith(b"0"):   # crude but the terminator is 0\r\n\r\n
+                if b"0\r\n\r\n" in body:
+                    break
+                b = s.recv(65536)
+                if not b:
+                    break
+                body += b
+            body = _dechunk(bytes(body))
+        else:                                          # no length hint: read to close
+            while True:
+                b = s.recv(65536)
+                if not b:
+                    break
+                body += b
+    status = lines[0].decode("latin-1").split(" ", 2) if lines else []
+    code = int(status[1]) if len(status) > 1 and status[1].isdigit() else 0
+    reason = status[2] if len(status) > 2 else ""
+    text = bytes(body).decode("utf-8", "replace")
+    if code >= 400:
+        detail = text.strip()[:400]
+        raise CDPError(f"{code} {reason}".strip() + (f": {detail}" if detail else ""))
+    return json.loads(text) if text.strip() else {}
+
+
+def _dechunk(body):
+    out = bytearray()
+    while body:
+        size_line, _, rest = body.partition(b"\r\n")
         try:
-            detail = e.read().decode("utf-8", "replace").strip()[:400]
-        except Exception:
-            detail = ""
-        raise CDPError(f"{e.code} {e.reason}" + (f": {detail}" if detail else "")) from None
-    return json.loads(body) if body.strip() else {}
+            size = int(size_line.split(b";")[0], 16)
+        except ValueError:
+            break
+        if size == 0:
+            break
+        out += rest[:size]
+        body = rest[size + 2:]        # skip the chunk data and its trailing CRLF
+    return bytes(out)
 
 
 def list_targets(host, port):
@@ -373,6 +455,11 @@ def connect(host, port, match, require_page=True):
             c._pooled = True
             _RUN_POOL[ws] = c
         c.buf.clear()                 # start each step with a clean event buffer
+        while True:                   # drain events that streamed in while idle
+            try:
+                c.q.get_nowait()      # (a left-on Page/Network domain keeps emitting)
+            except queue.Empty:
+                break
         return c, t
     return CDP(ws), t
 
@@ -2068,6 +2155,7 @@ def cmd_run(a):
     if not steps:
         raise UserError("no steps given (use --step, a FILE, or stdin)", "bad-args")
 
+    import shlex
     agent = getattr(a, "json", False)
     parser = build_parser()
     _RUN_ACTIVE = True
@@ -2357,6 +2445,30 @@ def _build_har(records, page_url):
                     "entries": entries}}
 
 
+def cmd_daemon(a):
+    from chromectl import daemon as d
+    action = a.action or "status"
+    if action == "start":
+        if a.foreground:
+            d.serve()                 # blocks until stopped
+            return
+        pid = d.spawn_background()
+        return emit(a, {"ok": True, "started": True, "pid": pid, "socket": d.SOCK},
+                    lambda: console.print(f"[green]daemon started[/green] pid {pid}  "
+                                          f"[dim]{d.SOCK}[/dim]\n"
+                                          f"route calls with [cyan]--daemon[/cyan] or "
+                                          f"[cyan]CHROMECTL_DAEMON=1[/cyan]"))
+    if action == "stop":
+        stopped = d.stop()
+        return emit(a, {"ok": stopped, "stopped": stopped},
+                    lambda: console.print(f"[green]daemon stopped[/green]" if stopped
+                                          else "[yellow]no daemon running[/yellow]"))
+    st = d.status()                   # "status"
+    return emit(a, st, lambda: console.print(
+        f"[green]up[/green] pid {st['pid']}, {st['pooled']} warm connection(s), "
+        f"up {st['uptime']}s" if st.get("running") else "[yellow]down[/yellow]"))
+
+
 def cmd_capture(a):
     if a.attach:
         c, t = connect(a.host, a.port, a.attach)
@@ -2492,6 +2604,354 @@ def cmd_capture(a):
                                     "mime": r.get("resp", {}).get("mimeType"),
                                     "bytes": len(r.get("body") or "")} for r in rows]})
     return rows
+
+
+# --------------------------------------------------------------------------
+# replay — re-send a captured/imported request, tampered, through the live
+# session (fetch engine) or out-of-band with full header control (raw engine).
+# The security-testing workhorse: import a Burp/curl/HAR request, swap the
+# identity with --as, and diff two identities with --vs to prove access control.
+# --------------------------------------------------------------------------
+
+# Headers a browser forbids scripts from setting on fetch(): if a replayed
+# request carries one, the fetch engine drops it silently — we surface them as
+# `dropped` so a tampered Host/Cookie is never lost without the tester knowing.
+_FETCH_FORBIDDEN = {
+    "accept-charset", "accept-encoding", "access-control-request-headers",
+    "access-control-request-method", "connection", "content-length", "cookie",
+    "cookie2", "date", "dnt", "expect", "host", "keep-alive", "origin",
+    "referer", "te", "trailer", "transfer-encoding", "upgrade", "via",
+}
+
+
+def _read_source(spec):
+    """Read a replay source file, or stdin when spec is '-'."""
+    if spec == "-":
+        return sys.stdin.read()
+    if not os.path.exists(spec):
+        raise UserError(f"no such file: {spec}", "not-found")
+    with open(spec) as f:
+        return f.read()
+
+
+def _parse_raw_http(text, scheme="https"):
+    """Parse a raw HTTP/1.1 request (Burp 'Copy to file' / Repeater save).
+
+    Wire format: request line, headers, a blank line, then the body. Burp files
+    carry no scheme, so it defaults to https (override with --scheme/--url).
+    """
+    text = text.replace("\r\n", "\n").lstrip("\n")
+    head, _, body = text.partition("\n\n")
+    lines = head.split("\n")
+    if not lines or len(lines[0].split()) < 2:
+        raise UserError("not a raw HTTP request (want 'METHOD /path HTTP/x')", "bad-args")
+    method, path = lines[0].split()[0], lines[0].split()[1]
+    headers = {}
+    for l in lines[1:]:
+        if ":" in l:
+            k, v = l.split(":", 1)
+            headers[k.strip()] = v.strip()
+    if path.startswith("http://") or path.startswith("https://"):
+        url = path
+    else:
+        host = next((v for k, v in headers.items() if k.lower() == "host"), None)
+        if not host:
+            raise UserError("raw request has no Host header and a relative path — "
+                            "pass --url", "bad-args")
+        url = f"{scheme}://{host}{path}"
+    return {"method": method, "url": url, "headers": headers, "body": body or None}
+
+
+def _parse_curl(text):
+    """Parse a `curl` command string (e.g. DevTools/Burp 'Copy as cURL')."""
+    import shlex
+    toks = shlex.split(text.replace("\\\n", " "))
+    if toks and toks[0] == "curl":
+        toks = toks[1:]
+    method, url, body, headers = None, None, None, {}
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("-X", "--request"):
+            i += 1; method = toks[i]
+        elif t in ("-H", "--header"):
+            i += 1
+            if ":" in toks[i]:
+                k, v = toks[i].split(":", 1); headers[k.strip()] = v.strip()
+        elif t in ("-d", "--data", "--data-raw", "--data-binary", "--data-ascii"):
+            i += 1; body = (body + "&" + toks[i]) if body else toks[i]
+        elif t in ("-b", "--cookie"):
+            i += 1; headers["Cookie"] = toks[i]
+        elif t in ("-A", "--user-agent"):
+            i += 1; headers["User-Agent"] = toks[i]
+        elif t in ("-e", "--referer"):
+            i += 1; headers["Referer"] = toks[i]
+        elif t == "--url":
+            i += 1; url = toks[i]
+        elif not t.startswith("-"):
+            url = t
+        # bare flags (-s, -k, --compressed, -i, -L, …) are ignored
+        i += 1
+    if not url:
+        raise UserError("no URL found in the curl command", "bad-args")
+    if body and not method:
+        method = "POST"
+    return {"method": method or "GET", "url": url, "headers": headers, "body": body}
+
+
+def _parse_har_entry(text, index):
+    try:
+        har = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise UserError(f"not valid HAR JSON: {e}", "bad-args")
+    entries = har.get("log", {}).get("entries", [])
+    if not entries:
+        raise UserError("HAR has no entries", "not-found")
+    if index >= len(entries):
+        raise UserError(f"--index {index} out of range (HAR has {len(entries)} entries)",
+                        "bad-args")
+    e = entries[index]
+    req = e.get("request", {})
+    headers = {h["name"]: h["value"] for h in req.get("headers", [])
+               if not h["name"].startswith(":")}       # drop HTTP/2 pseudo-headers
+    body = (req.get("postData") or {}).get("text")
+    baseline = None
+    resp = e.get("response")
+    if resp:
+        rh = {h["name"]: h["value"] for h in resp.get("headers", [])
+              if not h["name"].startswith(":")}
+        baseline = {"status": resp.get("status", 0), "headers": rh,
+                    "body": (resp.get("content") or {}).get("text", "")}
+    return {"method": req.get("method", "GET"), "url": req.get("url", ""),
+            "headers": headers, "body": body, "_baseline": baseline}
+
+
+def _load_source(a):
+    """Turn whichever --burp/--curl/--har was given into one request dict."""
+    given = [x for x in (a.burp, a.curl, a.har) if x]
+    if len(given) != 1:
+        raise UserError("give exactly one of --burp, --curl or --har", "bad-args")
+    if a.burp:
+        return _parse_raw_http(_read_source(a.burp), a.scheme)
+    if a.curl:
+        return _parse_curl(_read_source(a.curl))
+    return _parse_har_entry(_read_source(a.har), a.index)
+
+
+def _cookies_for_url(session_file, url):
+    """Build a Cookie header from an `auth save` file for this URL's host."""
+    with open(session_file) as f:
+        state = json.load(f)
+    host = urlsplit(url).hostname or ""
+    jar = []
+    for ck in state.get("cookies", []):
+        dom = (ck.get("domain") or "").lstrip(".")
+        if dom and (host == dom or host.endswith("." + dom)):
+            jar.append(f"{ck['name']}={ck['value']}")
+    return "; ".join(jar)
+
+
+def _apply_mutations(req, a, session_file=None):
+    """Return a copy of req with CLI overrides + optional session cookies applied."""
+    r = {"method": req["method"], "url": req["url"],
+         "headers": dict(req["headers"]), "body": req.get("body")}
+    if a.method:
+        r["method"] = a.method
+    if a.url:
+        r["url"] = a.url
+    if a.body is not None:
+        r["body"] = a.body
+    if a.body_file:
+        r["body"] = _read_source(a.body_file)
+    for rm in a.remove_header or []:
+        for k in [k for k in r["headers"] if k.lower() == rm.lower()]:
+            del r["headers"][k]
+    for hv in a.set_header or []:
+        if ":" not in hv:
+            raise UserError(f"--set-header wants 'Name: value', got {hv!r}", "bad-args")
+        k, v = hv.split(":", 1)
+        for existing in [x for x in r["headers"] if x.lower() == k.strip().lower()]:
+            del r["headers"][existing]
+        r["headers"][k.strip()] = v.strip()
+    if session_file:
+        cookie = _cookies_for_url(session_file, r["url"])
+        for existing in [x for x in r["headers"] if x.lower() == "cookie"]:
+            del r["headers"][existing]
+        if cookie:
+            r["headers"]["Cookie"] = cookie
+    return r
+
+
+def _send_raw(req, timeout=30):
+    """Out-of-band send with full header control (true Burp-Repeater semantics):
+    no forbidden-header stripping, no redirect following (you see the 3xx)."""
+    import http.client
+    import ssl
+    u = urlsplit(req["url"])
+    host, port = u.hostname, u.port or (443 if u.scheme == "https" else 80)
+    path = (u.path or "/") + (("?" + u.query) if u.query else "")
+    if u.scheme == "https":
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout,
+                                           context=ssl._create_unverified_context())
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    body = req.get("body")
+    if isinstance(body, str):
+        body = body.encode()
+    headers = dict(req["headers"])
+    have = {k.lower() for k in headers}
+    conn.putrequest(req["method"], path, skip_host=True, skip_accept_encoding=True)
+    for k, v in headers.items():
+        conn.putheader(k, v)
+    if "host" not in have:
+        conn.putheader("Host", u.netloc)
+    if body is not None and "content-length" not in have:
+        conn.putheader("Content-Length", str(len(body)))
+    conn.endheaders(body)
+    resp = conn.getresponse()
+    data = resp.read()
+    out = {"status": resp.status, "headers": dict(resp.getheaders()), "body": data}
+    conn.close()
+    return out
+
+
+def _send_fetch(a, req):
+    """Send through the live tab via fetch() — carries the real session, honest
+    same-origin behavior. The browser drops forbidden headers; we report them."""
+    dropped = sorted(k for k in req["headers"] if k.lower() in _FETCH_FORBIDDEN)
+    headers = {k: v for k, v in req["headers"].items() if k.lower() not in _FETCH_FORBIDDEN}
+    opts = {"method": req["method"], "headers": headers,
+            "credentials": "include", "redirect": "manual"}
+    body_js = f"opts.body = {json.dumps(req['body'])};" if req.get("body") is not None else ""
+    js = f"""(async () => {{
+      const opts = {json.dumps(opts)};
+      {body_js}
+      const r = await fetch({json.dumps(req['url'])}, opts);
+      const body = await r.text();
+      const h = {{}}; r.headers.forEach((v, k) => h[k] = v);
+      return JSON.stringify({{status: r.status, headers: h, body: body, type: r.type}});
+    }})()"""
+    c, t = connect(a.host, a.port, a.attach or a.target)
+    try:
+        r = c.call("Runtime.evaluate", {"expression": js, "returnByValue": True,
+                                        "awaitPromise": True, "userGesture": True})
+        if "exceptionDetails" in r:
+            ex = r["exceptionDetails"]
+            raise UserError(ex.get("exception", {}).get("description",
+                            ex.get("text", "fetch failed")), "js-exception")
+        res = json.loads(r["result"]["value"])
+    finally:
+        c.close()
+    res["body"] = res["body"].encode()
+    res["_dropped"] = dropped
+    if res.get("type") == "opaqueredirect":
+        res["_note"] = ("fetch cannot read a redirect's status/Location — "
+                        "use --engine raw to see the 3xx")
+    return res
+
+
+def _as_text(body):
+    return body.decode("utf-8", "replace") if isinstance(body, (bytes, bytearray)) else (body or "")
+
+
+def _diff_responses(base, other):
+    import difflib
+    hb, ho = base["headers"], other["headers"]
+    lb = {k.lower(): k for k in hb}
+    lo = {k.lower(): k for k in ho}
+    added = {lo[k]: ho[lo[k]] for k in lo if k not in lb}
+    removed = {lb[k]: hb[lb[k]] for k in lb if k not in lo}
+    changed = {lb[k]: [hb[lb[k]], ho[lo[k]]] for k in lb
+               if k in lo and hb[lb[k]] != ho[lo[k]]}
+    tb, to = _as_text(base["body"]), _as_text(other["body"])
+    unified = "".join(difflib.unified_diff(
+        tb.splitlines(keepends=True), to.splitlines(keepends=True),
+        "baseline", "replay", n=2))[:4000]
+    return {"status": [base["status"], other["status"]],
+            "status_changed": base["status"] != other["status"],
+            "headers": {"added": added, "removed": removed, "changed": changed},
+            "body": {"baseline_bytes": len(tb), "replay_bytes": len(to),
+                     "identical": tb == to, "unified": unified}}
+
+
+def _do_send(a, req):
+    return _send_fetch(a, req) if a.engine == "fetch" else _send_raw(req, a.timeout)
+
+
+def cmd_replay(a):
+    src = _load_source(a)
+    if a.engine == "auto":
+        a.engine = "fetch" if a.attach else "raw"
+    if a.engine == "fetch" and (a.as_ or a.vs):
+        raise UserError("--as/--vs need --engine raw (fetch uses the browser's "
+                        "live session, not a supplied one)", "bad-args")
+
+    primary = _apply_mutations(src, a, a.as_)
+    res = _do_send(a, primary)
+
+    diff = None
+    if a.vs:
+        other_req = _apply_mutations(src, a, a.vs)
+        other_res = _send_raw(other_req, a.timeout)
+        diff = _diff_responses(res, other_res)
+    elif a.diff:
+        base = src.get("_baseline")
+        if not base:
+            raise UserError("--diff needs a source that carries a response "
+                            "(--har), or use --vs SESSION for two identities", "bad-args")
+        diff = _diff_responses({"status": base["status"], "headers": base["headers"],
+                                "body": base.get("body", "")}, res)
+
+    body_text = _as_text(res["body"])
+    payload = {"ok": True, "engine": a.engine,
+               "request": {"method": primary["method"], "url": primary["url"],
+                           "headers": len(primary["headers"]),
+                           "body_bytes": len(primary.get("body") or "")},
+               "as": a.as_, "vs": a.vs,
+               "response": {"status": res["status"],
+                            "headers": res["headers"],
+                            "bytes": len(res["body"]),
+                            "body_preview": body_text[:a.bodycap]},
+               "dropped_headers": res.get("_dropped", []),
+               "note": res.get("_note"), "diff": diff}
+    if a.out:
+        with open(a.out, "wb") as f:
+            f.write(res["body"] if isinstance(res["body"], bytes) else res["body"].encode())
+
+    def render():
+        console.print(Rule(f"[green]{primary['method']}[/green] {primary['url'][:80]} "
+                           f"[dim]({a.engine})[/dim]"))
+        if a.as_:
+            console.print(f"  [cyan]as[/cyan] {a.as_}")
+        if res.get("_dropped"):
+            console.print(f"  [yellow]dropped (forbidden in fetch):[/yellow] "
+                          f"{', '.join(res['_dropped'])}")
+        if res.get("_note"):
+            console.print(f"  [yellow]{res['_note']}[/yellow]")
+        console.print(f"  → [bold]{res['status']}[/bold]  {len(res['body'])} bytes")
+        if diff:
+            s = diff["status"]
+            console.print(Rule("[bold]diff[/bold]  "
+                               f"baseline {s[0]} vs replay {s[1]}", style="dim"))
+            h = diff["headers"]
+            if h["added"]:
+                console.print(f"  [green]+headers[/green] {', '.join(h['added'])}")
+            if h["removed"]:
+                console.print(f"  [red]-headers[/red] {', '.join(h['removed'])}")
+            if h["changed"]:
+                console.print(f"  [yellow]~headers[/yellow] {', '.join(h['changed'])}")
+            b = diff["body"]
+            console.print(f"  body: {b['baseline_bytes']} → {b['replay_bytes']} bytes"
+                          + ("  [dim](identical)[/dim]" if b["identical"] else ""))
+            if b["unified"] and not b["identical"]:
+                console.print(Syntax(b["unified"], "diff", theme="ansi_dark"))
+        else:
+            console.print(_fmt_headers(res["headers"]))
+            console.print("--- body ---")
+            console.print(body_text[:a.bodycap] + (
+                f"\n… [truncated, {len(body_text)} chars]" if len(body_text) > a.bodycap else ""))
+
+    return emit(a, payload, render)
 
 
 SEO_JS = r"""(() => {
@@ -3246,6 +3706,8 @@ def build_parser():
     p.add_argument("--port", type=int, default=int(os.environ.get("CDP_PORT", "9222")))
     p.add_argument("-i", "--instance", metavar="NAME",
                    help="target a managed instance by name/port (from `chromectl instances`)")
+    p.add_argument("--daemon", action="store_true",
+                   help="route this command through a running `chromectl daemon` (warm connections)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     jsonopt = argparse.ArgumentParser(add_help=False)
@@ -3601,6 +4063,50 @@ def build_parser():
     sp.add_argument("--max", type=float, default=20, help="max capture seconds")
     sp.add_argument("--quiet", type=float, default=1.5, help="stop after this many idle seconds post-load")
     sp.set_defaults(fn=cmd_capture)
+
+    sp = sub.add_parser("replay", parents=[jsonopt],
+                        help="re-send a captured/imported request (Burp/curl/HAR), tampered, "
+                             "through the live session or out-of-band")
+    src = sp.add_argument_group("source (give exactly one)")
+    src.add_argument("--burp", metavar="FILE", help="raw HTTP/1.1 request file (Burp save); - for stdin")
+    src.add_argument("--curl", metavar="FILE", help="file with a `curl` command (Copy as cURL); - for stdin")
+    src.add_argument("--har", metavar="FILE", help="a .har file (use --index to pick an entry)")
+    sp.add_argument("--index", type=int, default=0, help="which HAR entry to replay (default 0)")
+    sp.add_argument("--scheme", default="https", choices=["http", "https"],
+                    help="scheme for a raw request with a relative path (default https)")
+    mut = sp.add_argument_group("mutations")
+    mut.add_argument("--method", help="override the HTTP method")
+    mut.add_argument("--url", help="override the full URL")
+    mut.add_argument("--set-header", metavar="'Name: value'", action="append",
+                     help="add/replace a header (repeatable)")
+    mut.add_argument("--remove-header", metavar="NAME", action="append",
+                     help="drop a header (repeatable)")
+    mut.add_argument("--body", help="replace the request body")
+    mut.add_argument("--body-file", metavar="FILE", help="replace the request body from a file")
+    ident = sp.add_argument_group("identity & diff (raw engine)")
+    ident.add_argument("--as", dest="as_", metavar="SESSION.json",
+                       help="send with cookies from an `auth save` file (raw engine)")
+    ident.add_argument("--vs", metavar="SESSION.json",
+                       help="also send as this second identity and diff the two responses")
+    ident.add_argument("--diff", action="store_true",
+                       help="diff the replay against the response stored in the source (--har)")
+    sp.add_argument("--engine", choices=["auto", "raw", "fetch"], default="auto",
+                    help="raw = out-of-band, full header control, sees redirects; "
+                         "fetch = through --attach tab, real session; auto = fetch if --attach else raw")
+    sp.add_argument("--attach", metavar="TARGET", help="tab to run the fetch engine in")
+    target_arg(sp)
+    sp.add_argument("--timeout", type=float, default=30, help="raw send timeout (seconds)")
+    sp.add_argument("--out", metavar="FILE", help="write the response body to a file")
+    sp.add_argument("--bodycap", type=int, default=2000, help="max body chars shown")
+    sp.set_defaults(fn=cmd_replay)
+
+    sp = sub.add_parser("daemon", parents=[jsonopt],
+                        help="run a resident process holding warm CDP connections")
+    sp.add_argument("action", nargs="?", choices=["start", "stop", "status"],
+                    help="start | stop | status (default status)")
+    sp.add_argument("--foreground", action="store_true",
+                    help="with start: run in this terminal instead of backgrounding")
+    sp.set_defaults(fn=cmd_daemon)
     return p
 
 
@@ -3617,8 +4123,14 @@ def die(args, kind, message, hint=""):
     sys.exit(1)
 
 
-def main():
-    args = build_parser().parse_args()
+def dispatch(args):
+    """Resolve the instance, then run the command with the shared error mapping.
+
+    Extracted from main() so the daemon runs commands through the exact same
+    path — same -i resolution, same error.kind vocabulary — as the plain CLI.
+    Errors funnel through die(), which prints per --json and raises SystemExit;
+    callers decide what to do with that (main exits; the daemon captures it).
+    """
     if getattr(args, "instance", None):        # -i NAME → that instance's host/port
         inst = _find_instance(args.instance)
         if not inst:
@@ -3636,6 +4148,18 @@ def main():
             f"(is Chrome running with --remote-debugging-port={args.port}?)")
     except (CDPError, TimeoutError) as e:
         die(args, "cdp", e)
+
+
+def main():
+    args = build_parser().parse_args()
+    # Route to a running daemon when asked (--daemon / CHROMECTL_DAEMON), unless
+    # this is a streaming/process-management command that must run locally.
+    if getattr(args, "daemon", False) or os.environ.get("CHROMECTL_DAEMON"):
+        from chromectl import daemon as _d
+        if args.cmd not in _d.NON_ROUTABLE and _d.is_running():
+            sys.exit(_d.route(sys.argv[1:]))
+    try:
+        dispatch(args)
     except KeyboardInterrupt:
         sys.exit(130)
 
