@@ -43,48 +43,93 @@ class _Shutdown(Exception):
 
 
 # --------------------------------------------------------------------------
-# wire protocol (both ends)
+# wire protocol (both ends) — one JSON object per line over a buffered file.
+# A makefile handles framing correctly across many messages on one connection,
+# which is what the persistent stream (Client, and the server loop) relies on.
 # --------------------------------------------------------------------------
-def _send(sock, obj):
-    sock.sendall((json.dumps(obj) + "\n").encode())
+def _send(f, obj):
+    f.write((json.dumps(obj) + "\n").encode())
+    f.flush()
 
 
-def _recv(sock):
-    """Read one newline-terminated JSON message. Bodies can be large (an html
-    dump, a screenshot's JSON); json.dumps escapes real newlines, so the only
-    literal '\\n' is our terminator — read until we see it."""
-    buf = bytearray()
-    while b"\n" not in buf:
-        chunk = sock.recv(65536)
-        if not chunk:
-            break
-        buf += chunk
-    return json.loads(bytes(buf).split(b"\n", 1)[0]) if buf.strip() else {}
+def _recv(f):
+    """Read one message, or None at EOF (a clean disconnect)."""
+    line = f.readline()
+    return json.loads(line) if line.strip() else None
+
+
+@contextlib.contextmanager
+def _dial(timeout=30):
+    """A short-lived connection for one request/response (the CLI-side helpers)."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(SOCK)
+    f = s.makefile("rwb")
+    try:
+        yield f
+    finally:
+        with contextlib.suppress(Exception):
+            f.close()
+        s.close()
 
 
 # --------------------------------------------------------------------------
 # client side
 # --------------------------------------------------------------------------
+class Client:
+    """A resident connection to the daemon: connect once, call many times.
+
+    This is the pattern the daemon exists for — a long-lived agent that issues
+    many commands pays the Python boot zero times per command and skips even the
+    per-call socket setup:
+
+        with Client() as c:
+            c.call(["open", "https://target"])
+            c.call(["replay", "--burp", "req.txt", "--as", "a.json", "--json"])
+    """
+
+    def __init__(self, timeout=30):
+        if not is_running():
+            raise ConnectionError("no daemon running (start it: chromectl daemon start)")
+        self._s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._s.settimeout(timeout)
+        self._s.connect(SOCK)
+        self._f = self._s.makefile("rwb")
+
+    def call(self, argv):
+        """Run one command; return {ok, code, stdout, stderr}."""
+        _send(self._f, {"argv": list(argv)})
+        return _recv(self._f) or {}
+
+    def close(self):
+        with contextlib.suppress(Exception):
+            self._f.close()
+            self._s.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
 def is_running():
     """True iff a daemon answers on the socket (a stale socket file → False)."""
     if not os.path.exists(SOCK):
         return False
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(2)
-            s.connect(SOCK)
-            _send(s, {"op": "ping"})
-            return bool(_recv(s).get("ok"))
+        with _dial(timeout=2) as f:
+            _send(f, {"op": "ping"})
+            return bool((_recv(f) or {}).get("ok"))
     except OSError:
         return False
 
 
 def route(argv):
-    """Forward argv to the daemon; print its output; return its exit code."""
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.connect(SOCK)
-        _send(s, {"argv": list(argv)})
-        resp = _recv(s)
+    """Forward one argv to the daemon; print its output; return its exit code."""
+    with _dial() as f:
+        _send(f, {"argv": list(argv)})
+        resp = _recv(f) or {}
     sys.stdout.write(resp.get("stdout", ""))
     sys.stderr.write(resp.get("stderr", ""))
     return int(resp.get("code", 0))
@@ -93,10 +138,9 @@ def route(argv):
 def status():
     if not is_running():
         return {"ok": True, "running": False}
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.connect(SOCK)
-        _send(s, {"op": "status"})
-        st = _recv(s)
+    with _dial() as f:
+        _send(f, {"op": "status"})
+        st = _recv(f) or {}
     st["running"] = True
     return st
 
@@ -105,10 +149,9 @@ def stop():
     """Ask the daemon to shut down; fall back to signalling the pidfile."""
     if is_running():
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                s.connect(SOCK)
-                _send(s, {"op": "shutdown"})
-                _recv(s)
+            with _dial() as f:
+                _send(f, {"op": "shutdown"})
+                _recv(f)
             return True
         except OSError:
             pass
@@ -145,6 +188,19 @@ def spawn_background():
 # --------------------------------------------------------------------------
 # server side
 # --------------------------------------------------------------------------
+_PARSER = None
+
+
+def _parser(cli):
+    """Build the argparse tree once and reuse it. Rebuilding it per request cost
+    ~11ms — the dominant per-call expense — and argparse parsers are safe to
+    parse_args() repeatedly (each call returns a fresh Namespace)."""
+    global _PARSER
+    if _PARSER is None:
+        _PARSER = cli.build_parser()
+    return _PARSER
+
+
 def _run_command(cli, argv):
     """Parse+dispatch one argv inside the daemon, capturing output and code.
 
@@ -158,7 +214,7 @@ def _run_command(cli, argv):
     code = 0
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(errbuf):
         try:
-            args = cli.build_parser().parse_args(argv)
+            args = _parser(cli).parse_args(argv)
             cli.dispatch(args)
         except SystemExit as e:             # die() and argparse both exit this way
             code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
@@ -168,29 +224,46 @@ def _run_command(cli, argv):
     return code, out.getvalue(), errbuf.getvalue()
 
 
-def _handle(conn, cli, started):
-    conn.settimeout(30)
-    req = _recv(conn)
+def _process(req, cli, started):
+    """Turn one request into one response dict. A 'shutdown' response also
+    carries {"shutdown": true} so the loop knows to break after replying."""
     op = req.get("op")
     if op == "ping":
-        _send(conn, {"ok": True})
-        return
+        return {"ok": True}
     if op == "status":
-        _send(conn, {"ok": True, "pid": os.getpid(),
-                     "uptime": round(time.time() - started, 1),
-                     "pooled": len(cli._RUN_POOL)})
-        return
+        return {"ok": True, "pid": os.getpid(),
+                "uptime": round(time.time() - started, 1),
+                "pooled": len(cli._RUN_POOL)}
     if op == "shutdown":
-        _send(conn, {"ok": True, "shutdown": True})
-        raise _Shutdown()
+        return {"ok": True, "shutdown": True}
     argv = req.get("argv")
     if argv is None:
-        _send(conn, {"ok": False, "code": 2, "stdout": "",
-                     "stderr": "bad request: no argv\n"})
-        return
+        return {"ok": False, "code": 2, "stdout": "", "stderr": "bad request: no argv\n"}
     code, out, errout = _run_command(cli, argv)
     _evict_dead(cli)
-    _send(conn, {"ok": code == 0, "code": code, "stdout": out, "stderr": errout})
+    return {"ok": code == 0, "code": code, "stdout": out, "stderr": errout}
+
+
+def _handle(conn, cli, started):
+    """Serve one connection: handle requests until the client disconnects.
+
+    Persistent — a resident Client sends many requests over one connection, so
+    we loop until EOF. One-shot CLI helpers just send a single request and hang
+    up, which reads as EOF on the next iteration."""
+    conn.settimeout(None)
+    f = conn.makefile("rwb")
+    try:
+        while True:
+            req = _recv(f)
+            if req is None:                 # client hung up
+                return
+            resp = _process(req, cli, started)
+            _send(f, resp)
+            if resp.get("shutdown"):
+                raise _Shutdown()
+    finally:
+        with contextlib.suppress(Exception):
+            f.close()
 
 
 def _evict_dead(cli):

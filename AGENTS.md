@@ -193,14 +193,24 @@ The daemon runs the same command dispatch as the CLI over one long-lived
 process, keeping the connection pool warm between requests. **It is not a
 speed-up for one-shot shell calls** — a `chromectl …` invocation still boots
 Python (~100ms) before it can even talk to the daemon, so `--daemon` there is
-marginally *slower*. The win is for a **resident client**: a process that
-connects once and issues many commands pays the boot exactly once — ~14ms per
-command vs ~100ms cold (~7× faster). Streaming/interactive and
-process-management commands (`watch`, `console`, `intercept`, `capture`,
-`dialog`, `repl`, `run`, `start`, `stop`, `download`, `heapsnapshot`) always run
-locally, never through the daemon. The socket is a user-only Unix socket at
-`~/.chromectl/daemon.sock` speaking one-JSON-object-per-line — the same seam an
-agent can hold open to drive Chrome as a live stream.
+marginally *slower*. The win is for a **resident client** that connects once and
+issues many commands: it pays the Python boot exactly once, and each command is
+then ~1ms vs ~100ms cold (~80× faster). Drive it from Python with the persistent
+stream:
+
+```python
+from chromectl.daemon import Client
+with Client() as c:                       # one connection, many commands
+    c.call(["open", "https://target"])
+    c.call(["replay", "--burp", "req.txt", "--as", "a.json", "--json"])
+```
+
+Streaming/interactive and process-management commands (`watch`, `console`,
+`intercept`, `capture`, `dialog`, `repl`, `run`, `start`, `stop`, `download`,
+`heapsnapshot`) always run locally, never through the daemon. The socket is a
+user-only Unix socket at `~/.chromectl/daemon.sock` speaking
+one-JSON-object-per-line — the same seam an agent holds open to drive Chrome as
+a live stream.
 
 ## All commands
 

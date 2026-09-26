@@ -377,6 +377,14 @@ def test_daemon_lifecycle_protocol_and_routing(tmp_path, monkeypatch):
         code = d.route(["cheat", "--json"])
     assert code == 0 and "replay" in buf.getvalue()
 
+    # a persistent Client issues many requests over ONE connection (the stream)
+    with d.Client() as client:
+        r1 = client.call(["cheat", "--json"])
+        r2 = client.call(["--port", "1", "version", "--json"])
+        assert r1["ok"] is True and r1["code"] == 0 and "replay" in r1["stdout"]
+        assert r2["ok"] is False and r2["code"] == 1
+        assert json.loads(r2["stdout"])["error"]["kind"] == "connection"
+
     assert d.stop() is True
     for _ in range(60):
         if not d.is_running():
