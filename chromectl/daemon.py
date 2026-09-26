@@ -18,17 +18,24 @@ Requests:
     {"argv": ["eval", "t", "1+1", "--json"]}
         -> {"ok": bool, "code": int, "stdout": str, "stderr": str}
 """
+import collections
 import contextlib
 import io
 import json
 import os
+import queue
 import socket
 import sys
+import threading
 import time
 
 _DIR = os.path.expanduser("~/.chromectl")
 SOCK = os.path.join(_DIR, "daemon.sock")
 PIDFILE = os.path.join(_DIR, "daemon.pid")
+
+# Set True inside the resident daemon process; commands that need to hold state
+# between calls (the capture buffer) check it and refuse to run locally.
+_IN_DAEMON = False
 
 # Commands that stream/block (run until Ctrl-C or --max) or manage OS processes:
 # these must run in their own process, never inside the shared daemon loop.
@@ -186,6 +193,108 @@ def spawn_background():
 
 
 # --------------------------------------------------------------------------
+# capture ring buffer — a resident, always-on tap on a target's network traffic.
+# The daemon holds one CDP connection with Network enabled and a background
+# thread appending each request to a bounded deque, so an agent can watch traffic
+# accumulate and `replay --last` any of it without pre-arming a capture. Records
+# hold the full request (method/url/headers/postData) — enough to replay — but
+# not response bodies, so memory stays bounded by maxlen.
+# --------------------------------------------------------------------------
+_BUFFER = collections.deque(maxlen=1000)
+_BUFFER_LOCK = threading.Lock()
+_CAPTURE = None                 # {cdp, thread, stop, target, started} while running
+
+
+def _compact(rid, r):
+    req = r.get("req", {})
+    return {"id": rid, "ts": r.get("ts"), "type": r.get("type"),
+            "method": req.get("method"), "url": req.get("url"),
+            "status": r.get("status"), "mime": r.get("mime"),
+            "headers": req.get("headers", {}), "body": req.get("postData")}
+
+
+def _capture_loop(conn, stop):
+    records = {}
+    while not stop.is_set():
+        try:
+            m = conn.q.get(timeout=0.3)
+        except queue.Empty:
+            continue
+        if "__error__" in m:                    # the tapped tab went away
+            break
+        method, p = m.get("method"), m.get("params", {})
+        if method == "Network.requestWillBeSent":
+            r = records.setdefault(p["requestId"], {})
+            r["req"] = p["request"]
+            r["type"] = p.get("type")
+            r["ts"] = p.get("wallTime")
+        elif method == "Network.responseReceived":
+            r = records.setdefault(p["requestId"], {})
+            r["status"] = p["response"].get("status")
+            r["mime"] = p["response"].get("mimeType")
+            if "req" in r:                       # complete enough to replay — record it
+                with _BUFFER_LOCK:
+                    _BUFFER.append(_compact(p["requestId"], r))
+
+
+def buffer_start(host, port, target, maxlen=1000):
+    global _CAPTURE, _BUFFER
+    import chromectl.cli as cli
+    if not _IN_DAEMON:
+        raise cli.UserError("the capture buffer needs the daemon "
+                            "(chromectl daemon start; then --daemon)", "bad-args")
+    if _CAPTURE:
+        raise cli.UserError("a capture buffer is already running (buffer stop first)", "exists")
+    t = cli.resolve(host, port, target)
+    conn = cli.CDP(cli._target_ws(t))
+    conn.call("Network.enable")
+    _BUFFER = collections.deque(maxlen=maxlen)
+    stop = threading.Event()
+    th = threading.Thread(target=_capture_loop, args=(conn, stop), daemon=True)
+    _CAPTURE = {"cdp": conn, "thread": th, "stop": stop,
+                "target": t.get("url", ""), "started": time.time()}
+    th.start()
+    return {"target": t.get("url", ""), "id": t.get("id"), "maxlen": maxlen}
+
+
+def buffer_stop():
+    global _CAPTURE
+    if not _CAPTURE:
+        return {"stopped": False}
+    _CAPTURE["stop"].set()
+    with contextlib.suppress(Exception):
+        _CAPTURE["cdp"].call("Network.disable", timeout=5)
+    with contextlib.suppress(Exception):
+        _CAPTURE["cdp"].close()
+    target = _CAPTURE["target"]
+    _CAPTURE = None
+    return {"stopped": True, "target": target}
+
+
+def buffer_list(maxn=50):
+    with _BUFFER_LOCK:
+        items = list(_BUFFER)
+    running = bool(_CAPTURE)
+    return {"running": running, "target": _CAPTURE["target"] if running else None,
+            "count": len(items),
+            "transactions": [{"i": i, "method": x["method"], "url": x["url"],
+                              "status": x["status"], "type": x["type"]}
+                             for i, x in enumerate(items)][-maxn:]}
+
+
+def buffer_get(index):
+    """Return the full record at index (negative counts from the end)."""
+    with _BUFFER_LOCK:
+        items = list(_BUFFER)
+    if not items:
+        return None
+    try:
+        return items[index]
+    except IndexError:
+        return None
+
+
+# --------------------------------------------------------------------------
 # server side
 # --------------------------------------------------------------------------
 _PARSER = None
@@ -276,6 +385,7 @@ def _evict_dead(cli):
 
 def serve():
     """Run the accept loop until a shutdown op or signal. Blocks."""
+    global _IN_DAEMON
     import chromectl.cli as cli
     os.makedirs(_DIR, exist_ok=True)
     if is_running():
@@ -289,6 +399,7 @@ def serve():
     with open(PIDFILE, "w") as f:
         f.write(str(os.getpid()))
     cli._RUN_ACTIVE = True                  # make connect() pool into cli._RUN_POOL
+    _IN_DAEMON = True
     started = time.time()
     try:
         while True:
@@ -302,6 +413,9 @@ def serve():
             finally:
                 conn.close()
     finally:
+        _IN_DAEMON = False
+        with contextlib.suppress(Exception):
+            buffer_stop()
         cli._RUN_ACTIVE = False         # don't leak pooling into anything else
         srv.close()
         for c in list(cli._RUN_POOL.values()):

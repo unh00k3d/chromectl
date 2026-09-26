@@ -212,6 +212,23 @@ user-only Unix socket at `~/.chromectl/daemon.sock` speaking
 one-JSON-object-per-line — the same seam an agent holds open to drive Chrome as
 a live stream.
 
+### Capture buffer + `replay --last`
+
+The daemon can hold an always-on tap on a target's traffic — a bounded ring
+buffer — so you can replay recent requests without having armed a capture first
+(these commands need `--daemon` and only work inside the daemon):
+
+```bash
+chromectl --daemon buffer start example        # tap the 'example' tab's network
+chromectl --daemon buffer list                 # recent requests, numbered
+chromectl --daemon replay --last               # replay the most recent request
+chromectl --daemon replay --last 3 --as b.json # 3rd-most-recent, as another identity
+chromectl --daemon buffer stop
+```
+
+Records hold the full request (method/url/headers/body) — enough to replay and
+tamper — but not response bodies, so memory stays bounded by the ring size.
+
 ## All commands
 
 | command | usage | what |
@@ -267,5 +284,6 @@ a live stream.
 | `console (logs)` | `[target] --json --max MAX` | tail console messages + JS errors |
 | `seo` | `[target] --json` | on-page SEO audit of a tab or URL |
 | `capture` | `[url] --json --attach TARGET --reload --type TYPE --print PRINT --out OUT --har HAR --no-bodies --bodycap BODYCAP --max MAX --quiet QUIET` | Burp-style full request/response capture |
-| `replay` | `[target] --json --burp FILE --curl FILE --har FILE --index INDEX --scheme {http,https} --method METHOD --url URL --set-header 'Name: value' --remove-header NAME --body BODY --body-file FILE --as SESSION.json --vs SESSION.json --diff --engine {auto,raw,fetch} --attach TARGET --timeout TIMEOUT --out FILE --bodycap BODYCAP` | re-send a captured/imported request (Burp/curl/HAR), tampered, through the live session or out-of-band |
+| `replay` | `[target] --json --burp FILE --curl FILE --har FILE --last N --index INDEX --scheme {http,https} --method METHOD --url URL --set-header 'Name: value' --remove-header NAME --body BODY --body-file FILE --as SESSION.json --vs SESSION.json --diff --engine {auto,raw,fetch} --attach TARGET --timeout TIMEOUT --out FILE --bodycap BODYCAP` | re-send a captured/imported request (Burp/curl/HAR), tampered, through the live session or out-of-band |
 | `daemon` | `[action] --json --foreground` | run a resident process holding warm CDP connections |
+| `buffer` | `[action] [target] --json --maxlen MAXLEN --max MAX` | daemon-resident ring buffer of live network traffic (for replay --last) |

@@ -2445,6 +2445,41 @@ def _build_har(records, page_url):
                     "entries": entries}}
 
 
+def cmd_buffer(a):
+    from chromectl import daemon as d
+    if not d._IN_DAEMON:
+        raise UserError("the capture buffer lives in the daemon — start it "
+                        "(chromectl daemon start) and route with --daemon", "bad-args")
+    action = a.action or "list"
+    if action == "start":
+        info = d.buffer_start(a.host, a.port, a.target, maxlen=a.maxlen)
+        return emit(a, {"ok": True, **info},
+                    lambda: console.print(f"[green]capturing[/green] {info['target']} "
+                                          f"[dim](ring of {info['maxlen']})[/dim]"))
+    if action == "stop":
+        info = d.buffer_stop()
+        return emit(a, {"ok": True, **info},
+                    lambda: console.print(f"[green]stopped[/green] {info.get('target') or ''}"
+                                          if info.get("stopped") else
+                                          "[yellow]no capture running[/yellow]"))
+    info = d.buffer_list(a.max)               # list
+
+    def render():
+        if not info["running"] and not info["count"]:
+            console.print("[yellow]no capture running[/yellow] "
+                          "(chromectl --daemon buffer start TARGET)")
+            return
+        console.print(Rule(f"[bold]{info['count']}[/bold] buffered · {info['target'] or ''}"))
+        tbl = Table(header_style="bold cyan")
+        for col in ("#", "method", "status", "type", "url"):
+            tbl.add_column(col)
+        for x in info["transactions"]:
+            tbl.add_row(str(x["i"]), x["method"] or "?", str(x["status"] or "-"),
+                        x["type"] or "", (x["url"] or "")[:80])
+        console.print(tbl)
+    return emit(a, {"ok": True, **info}, render)
+
+
 def cmd_daemon(a):
     from chromectl import daemon as d
     action = a.action or "status"
@@ -2727,15 +2762,32 @@ def _parse_har_entry(text, index):
 
 
 def _load_source(a):
-    """Turn whichever --burp/--curl/--har was given into one request dict."""
-    given = [x for x in (a.burp, a.curl, a.har) if x]
+    """Turn whichever --burp/--curl/--har/--last was given into one request dict."""
+    given = [x for x in (a.burp, a.curl, a.har, a.last) if x is not None and x is not False]
     if len(given) != 1:
-        raise UserError("give exactly one of --burp, --curl or --har", "bad-args")
+        raise UserError("give exactly one of --burp, --curl, --har or --last", "bad-args")
     if a.burp:
         return _parse_raw_http(_read_source(a.burp), a.scheme)
     if a.curl:
         return _parse_curl(_read_source(a.curl))
-    return _parse_har_entry(_read_source(a.har), a.index)
+    if a.har:
+        return _parse_har_entry(_read_source(a.har), a.index)
+    return _load_from_buffer(a.last)          # --last N
+
+
+def _load_from_buffer(n):
+    """Pull the Nth-most-recent request from the daemon's capture buffer."""
+    from chromectl import daemon as d
+    if not d._IN_DAEMON:
+        raise UserError("replay --last reads the daemon capture buffer — start it "
+                        "(chromectl daemon start), `buffer start TARGET`, and route "
+                        "with --daemon", "bad-args")
+    rec = d.buffer_get(-int(n))               # --last 1 = most recent
+    if rec is None:
+        raise UserError("capture buffer is empty or index out of range "
+                        "(see: chromectl --daemon buffer list)", "not-found")
+    return {"method": rec["method"], "url": rec["url"],
+            "headers": dict(rec.get("headers") or {}), "body": rec.get("body")}
 
 
 def _cookies_for_url(session_file, url):
@@ -4071,6 +4123,9 @@ def build_parser():
     src.add_argument("--burp", metavar="FILE", help="raw HTTP/1.1 request file (Burp save); - for stdin")
     src.add_argument("--curl", metavar="FILE", help="file with a `curl` command (Copy as cURL); - for stdin")
     src.add_argument("--har", metavar="FILE", help="a .har file (use --index to pick an entry)")
+    src.add_argument("--last", metavar="N", type=int, nargs="?", const=1, default=None,
+                     help="replay the Nth-most-recent request from the daemon capture buffer "
+                          "(bare --last = most recent); needs --daemon + `buffer start`")
     sp.add_argument("--index", type=int, default=0, help="which HAR entry to replay (default 0)")
     sp.add_argument("--scheme", default="https", choices=["http", "https"],
                     help="scheme for a raw request with a relative path (default https)")
@@ -4107,6 +4162,15 @@ def build_parser():
     sp.add_argument("--foreground", action="store_true",
                     help="with start: run in this terminal instead of backgrounding")
     sp.set_defaults(fn=cmd_daemon)
+
+    sp = sub.add_parser("buffer", parents=[jsonopt],
+                        help="daemon-resident ring buffer of live network traffic (for replay --last)")
+    sp.add_argument("action", nargs="?", choices=["start", "stop", "list"],
+                    help="start TARGET | stop | list (default list)")
+    target_arg(sp)
+    sp.add_argument("--maxlen", type=int, default=1000, help="ring size (default 1000)")
+    sp.add_argument("--max", type=int, default=50, help="how many to show in `list`")
+    sp.set_defaults(fn=cmd_buffer)
     return p
 
 

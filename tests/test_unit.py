@@ -398,3 +398,38 @@ def test_streaming_commands_are_not_routable():
     from chromectl import daemon as d
     for cmd in ("watch", "console", "intercept", "capture", "dialog", "repl", "run", "start"):
         assert cmd in d.NON_ROUTABLE
+
+
+def test_buffer_and_replay_last_refuse_outside_the_daemon():
+    """The capture buffer is daemon-resident; asking for it in a bare process
+    must fail with a clear bad-args, not silently operate on an empty buffer."""
+    from chromectl import daemon as d
+    assert d._IN_DAEMON is False
+    p = cli.build_parser()
+    with pytest.raises(cli.UserError) as e1:
+        cli.cmd_buffer(p.parse_args(["buffer", "list"]))
+    assert e1.value.kind == "bad-args"
+    with pytest.raises(cli.UserError) as e2:
+        cli.cmd_replay(p.parse_args(["replay", "--last"]))
+    assert e2.value.kind == "bad-args"
+
+
+def test_buffer_records_and_indexing(monkeypatch):
+    """buffer_list summarizes and buffer_get indexes the ring (newest = -1)."""
+    import collections
+
+    from chromectl import daemon as d
+    monkeypatch.setattr(d, "_IN_DAEMON", True)
+    buf = collections.deque(maxlen=10)
+    for i in range(3):
+        rec = {"req": {"method": "GET", "url": f"https://t/{i}",
+                       "headers": {"Cookie": "x"}, "postData": None},
+               "type": "xhr", "status": 200, "mime": "application/json", "ts": i}
+        buf.append(d._compact(f"r{i}", rec))
+    monkeypatch.setattr(d, "_BUFFER", buf)
+    listing = d.buffer_list(50)
+    assert listing["count"] == 3
+    assert listing["transactions"][-1]["url"] == "https://t/2"
+    assert d.buffer_get(-1)["url"] == "https://t/2"        # most recent
+    assert d.buffer_get(-3)["url"] == "https://t/0"
+    assert d.buffer_get(-99) is None                       # out of range
