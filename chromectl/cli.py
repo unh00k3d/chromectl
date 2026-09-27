@@ -3785,6 +3785,191 @@ def cmd_skill(a):
 
 
 # --------------------------------------------------------------------------
+# client: a prebuilt Go "thin client" (`cx`) that talks to the daemon
+# --------------------------------------------------------------------------
+# `cx` is a tiny statically-linked binary that forwards a command to a running
+# `chromectl daemon` over its socket and prints the reply — skipping Python's
+# import cost on every call — and falls back to invoking `chromectl` when no
+# daemon is up. We only *install* it here; a separate build_client.sh cross-
+# compiles the binaries into dist/cx/ under the asset names below.
+BIN_DIR = os.path.expanduser("~/.chromectl/bin")
+CLIENT_REPO = "0xenesbayram/chromectl"
+
+
+def _client_version():
+    """The chromectl version whose GitHub release carries the cx assets."""
+    try:
+        import chromectl
+        v = getattr(chromectl, "__version__", None)
+        if v:
+            return v
+    except Exception:
+        pass
+    # dev checkout: read it out of pyproject.toml sitting at the repo root
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        with open(os.path.join(root, "pyproject.toml")) as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("version") and "=" in s:
+                    return s.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return "0.3.0"
+
+
+def _client_asset_name(system, machine):
+    """Map (platform.system(), platform.machine()) → the release asset filename.
+
+    HARD CONTRACT with build_client.sh, which cross-compiles into dist/cx/ under
+    exactly these names — change one side and you must change the other.
+    """
+    os_map = {"Linux": "linux", "Darwin": "darwin", "Windows": "windows"}
+    arch_map = {"x86_64": "amd64", "amd64": "amd64",
+                "aarch64": "arm64", "arm64": "arm64"}
+    o = os_map.get(system)
+    a = arch_map.get((machine or "").lower())
+    if not o or not a:
+        raise UserError(
+            f"no prebuilt cx for {system}/{machine!r}; build it from source with "
+            "chromectl client install --build", "not-found")
+    name = f"cx-{o}-{a}"
+    if o == "windows":
+        name += ".exe"
+    return name
+
+
+def _client_bin_path():
+    import platform
+    name = "cx.exe" if platform.system() == "Windows" else "cx"
+    return os.path.join(BIN_DIR, name)
+
+
+def _client_on_path():
+    """Is ~/.chromectl/bin on PATH, so a bare `cx` resolves to what we install?"""
+    want = os.path.normcase(os.path.normpath(BIN_DIR))
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if entry and os.path.normcase(os.path.normpath(entry)) == want:
+            return True
+    return False
+
+
+def _client_download(asset, bin_path):
+    """Fetch the asset from the GitHub release and verify its sha256."""
+    import hashlib
+    import urllib.error
+    import urllib.request
+    version = _client_version()
+    base = f"https://github.com/{CLIENT_REPO}/releases/download/v{version}"
+    try:
+        with urllib.request.urlopen(f"{base}/{asset}", timeout=60) as r:
+            data = r.read()
+        with urllib.request.urlopen(f"{base}/SHA256SUMS", timeout=60) as r:
+            sums = r.read().decode()
+    except (urllib.error.URLError, OSError) as e:
+        raise UserError(
+            f"could not download {asset} from the v{version} release [{e}] — "
+            "install from a local build with --from dist/cx/ or --build instead",
+            "not-found")
+    want = None
+    for line in sums.splitlines():
+        parts = line.split()
+        # SHA256SUMS lines are "<hex>  <name>" (binary marker: "*<name>")
+        if len(parts) >= 2 and parts[-1].lstrip("*") == asset:
+            want = parts[0].lower()
+            break
+    if not want:
+        raise UserError(f"{asset} is not listed in the release SHA256SUMS", "tool-failed")
+    got = hashlib.sha256(data).hexdigest()
+    if got != want:
+        raise UserError(
+            f"sha256 mismatch for {asset}: expected {want}, got {got}", "tool-failed")
+    with open(bin_path, "wb") as f:
+        f.write(data)
+
+
+def cmd_client(a):
+    """Install / inspect / remove the prebuilt `cx` thin client."""
+    import platform
+    import shutil
+    action = a.action or "status"
+    bin_path = _client_bin_path()
+
+    if action == "status":
+        installed = os.path.exists(bin_path)
+
+        def render():
+            if installed:
+                console.print(f"[green]cx installed[/green] → {bin_path}")
+            else:
+                console.print("[yellow]cx not installed[/yellow] "
+                              "(chromectl client install)")
+            if not _client_on_path():
+                console.print('[dim]note: ~/.chromectl/bin is not on PATH — '
+                              'export PATH="$HOME/.chromectl/bin:$PATH"[/dim]')
+        return emit(a, {"ok": True, "installed": installed,
+                        "path": bin_path if installed else None,
+                        "on_path": _client_on_path()}, render)
+
+    if action == "uninstall":
+        removed = False
+        if os.path.exists(bin_path):
+            os.remove(bin_path)
+            removed = True
+        return emit(a, {"ok": True, "removed": removed},
+                    lambda: console.print(f"[green]removed[/green] {bin_path}" if removed
+                                          else "[yellow]nothing to remove[/yellow]"))
+
+    # install
+    asset = _client_asset_name(platform.system(), platform.machine())
+    os.makedirs(BIN_DIR, exist_ok=True)
+
+    if a.from_:
+        src = os.path.expanduser(a.from_)
+        if os.path.isdir(src):
+            cand = os.path.join(src, asset)
+            if not os.path.exists(cand):
+                raise UserError(f"{asset} not found in {src}", "not-found")
+            src = cand
+        elif not os.path.exists(src):
+            raise UserError(f"no such file: {src}", "not-found")
+        shutil.copyfile(src, bin_path)
+        source = "local"
+    elif a.build:
+        if not shutil.which("go"):
+            raise UserError(
+                "go is not on PATH — install Go to build cx from source", "missing-dep")
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cxdir = os.path.join(root, "client", "cx")   # the Go module lives here (no root go.mod)
+        if not os.path.isdir(cxdir):
+            raise UserError("client/cx source not found — --build needs a source checkout; "
+                            "use --from or a release download instead", "not-found")
+        import subprocess
+        r = subprocess.run(["go", "build", "-o", bin_path, "."],
+                           cwd=cxdir, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise UserError(
+                "go build failed: " + (r.stderr.strip() or r.stdout.strip()),
+                "tool-failed")
+        source = "build"
+    else:
+        _client_download(asset, bin_path)
+        source = "download"
+
+    os.chmod(bin_path, 0o755)
+
+    def render():
+        console.print(f"[green]installed cx[/green] → {bin_path} [dim]({source})[/dim]")
+        if _client_on_path():
+            console.print("[dim]run it as [cyan]cx <args>[/cyan] "
+                          "(a fast drop-in for chromectl)[/dim]")
+        else:
+            console.print('[yellow]~/.chromectl/bin is not on PATH[/yellow] — add it:\n'
+                          '  export PATH="$HOME/.chromectl/bin:$PATH"')
+    return emit(a, {"ok": True, "installed": bin_path, "source": source}, render)
+
+
+# --------------------------------------------------------------------------
 # argument parsing
 # --------------------------------------------------------------------------
 def build_parser():
@@ -4215,6 +4400,18 @@ def build_parser():
                     help="list: rows to show (default 50); subscribe: stop after N seconds "
                          "(0 = until Ctrl-C)")
     sp.set_defaults(fn=cmd_buffer)
+
+    sp = sub.add_parser("client", parents=[jsonopt],
+                        help="install the prebuilt `cx` thin client (fast daemon drop-in)")
+    sp.add_argument("action", nargs="?", default="status",
+                    choices=["install", "status", "uninstall"],
+                    metavar="{install,status,uninstall}",
+                    help="install | status | uninstall (default status)")
+    sp.add_argument("--from", dest="from_", metavar="PATH",
+                    help="install from a local file or dist dir instead of downloading")
+    sp.add_argument("--build", action="store_true",
+                    help="build from source with `go` instead of downloading")
+    sp.set_defaults(fn=cmd_client)
     return p
 
 

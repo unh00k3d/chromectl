@@ -6,3 +6,7 @@ build/
 trace.json
 dist/
 .pytest_cache/
+
+# stray local go builds of the cx client (release binaries go in dist/)
+client/cx/cx
+client/cx/cx.exe

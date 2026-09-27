@@ -1,6 +1,8 @@
 """Tests that need no browser: parsing, flag merging, the surface, the skill."""
 import argparse
 import json
+import os
+import platform
 
 import pytest
 
@@ -469,3 +471,71 @@ def test_buffer_records_and_indexing(monkeypatch):
     assert d.buffer_get(-1)["url"] == "https://t/2"        # most recent
     assert d.buffer_get(-3)["url"] == "https://t/0"
     assert d.buffer_get(-99) is None                       # out of range
+
+
+# --- client: the prebuilt `cx` thin-client installer -----------------------
+@pytest.mark.parametrize("system,machine,expected", [
+    ("Linux", "x86_64", "cx-linux-amd64"),
+    ("Linux", "aarch64", "cx-linux-arm64"),
+    ("Darwin", "arm64", "cx-darwin-arm64"),
+    ("Darwin", "x86_64", "cx-darwin-amd64"),
+    ("Windows", "AMD64", "cx-windows-amd64.exe"),
+    ("Windows", "arm64", "cx-windows-arm64.exe"),
+])
+def test_client_asset_name_maps_platform_to_the_build_contract(system, machine, expected):
+    assert cli._client_asset_name(system, machine) == expected
+
+
+def test_client_asset_name_rejects_an_unknown_arch():
+    with pytest.raises(cli.UserError) as ei:
+        cli._client_asset_name("Linux", "sparc64")
+    assert ei.value.kind == "not-found"
+
+
+def test_client_install_from_file_roundtrip(tmp_path, monkeypatch):
+    """--from a local file lands an executable at BIN_DIR/cx; status/uninstall agree.
+
+    Uses the local path only — the download path can't be exercised without a
+    real GitHub release, so it is intentionally not tested here.
+    """
+    bindir = tmp_path / "bin"
+    monkeypatch.setattr(cli, "BIN_DIR", str(bindir))
+    # keep the platform deterministic so the binary name is 'cx' (not cx.exe)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    # ensure the PATH check has something to say and never crashes
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    fake = tmp_path / "cx-src"
+    fake.write_bytes(b"#!/bin/sh\necho cx\n")
+
+    parser = cli.build_parser()
+    result = cli.cmd_client(parser.parse_args(
+        ["client", "install", "--from", str(fake), "--json"]))
+    dest = bindir / "cx"
+    assert result["ok"] and result["source"] == "local"
+    assert result["installed"] == str(dest)
+    assert dest.exists() and os.access(dest, os.X_OK)
+
+    status = cli.cmd_client(parser.parse_args(["client", "status", "--json"]))
+    assert status["installed"] is True and status["path"] == str(dest)
+
+    removed = cli.cmd_client(parser.parse_args(["client", "uninstall", "--json"]))
+    assert removed["removed"] is True
+    assert not dest.exists()
+
+    status = cli.cmd_client(parser.parse_args(["client", "status", "--json"]))
+    assert status["installed"] is False and status["path"] is None
+
+
+def test_client_install_from_dir_finds_the_platform_asset(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "cx-linux-amd64").write_bytes(b"bin")
+    parser = cli.build_parser()
+    result = cli.cmd_client(parser.parse_args(
+        ["client", "install", "--from", str(dist), "--json"]))
+    assert result["ok"] and (tmp_path / "bin" / "cx").exists()

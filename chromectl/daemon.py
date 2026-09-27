@@ -19,6 +19,8 @@ Requests:
                                            capture events) until the client hangs up
     {"argv": ["eval", "t", "1+1", "--json"]}
         -> {"ok": bool, "code": int, "stdout": str, "stderr": str}
+        -> {"ok": true, "passthrough": true}   for a non-routable command; the
+           client (cx) runs it locally instead of in the daemon
 """
 import collections
 import contextlib
@@ -359,12 +361,23 @@ def _parser(cli):
     return _PARSER
 
 
+def _is_passthrough(args):
+    """A command the daemon must NOT run in-process: it streams/blocks or manages
+    OS processes, or it's the client-side `buffer subscribe`. The client (cx) runs
+    these locally instead. The daemon is the single source of truth for this, so a
+    thin client needs no copy of the list."""
+    return (args.cmd in NON_ROUTABLE
+            or (args.cmd == "buffer" and getattr(args, "action", None) == "subscribe"))
+
+
 def _run_command(cli, argv):
     """Parse+dispatch one argv inside the daemon, capturing output and code.
 
     Reuses cli.dispatch (same -i resolution and error mapping as the CLI). The
     lazy consoles are reset so any human-mode rich output lands in our captured
-    buffers rather than the daemon's own stdout.
+    buffers rather than the daemon's own stdout. Returns a response dict; a
+    non-routable command yields {"passthrough": true} so the client runs it
+    locally instead.
     """
     out, errbuf = io.StringIO(), io.StringIO()
     cli.console._real = None
@@ -373,13 +386,21 @@ def _run_command(cli, argv):
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(errbuf):
         try:
             args = _parser(cli).parse_args(argv)
+        except SystemExit as e:             # argparse rejected the args
+            code = e.code if isinstance(e.code, int) else (0 if e.code is None else 2)
+            return {"ok": code == 0, "code": code,
+                    "stdout": out.getvalue(), "stderr": errbuf.getvalue()}
+        if _is_passthrough(args):
+            return {"ok": True, "passthrough": True}
+        try:
             cli.dispatch(args)
-        except SystemExit as e:             # die() and argparse both exit this way
+        except SystemExit as e:             # die() exits this way
             code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
         except BaseException as e:          # never let one bad request kill the loop
             code = 1
             errbuf.write(f"{type(e).__name__}: {e}\n")
-    return code, out.getvalue(), errbuf.getvalue()
+    return {"ok": code == 0, "code": code,
+            "stdout": out.getvalue(), "stderr": errbuf.getvalue()}
 
 
 # Commands run one at a time under this lock (the connection pool and the
@@ -407,9 +428,10 @@ def _process(req, cli, started):
     if argv is None:
         return {"ok": False, "code": 2, "stdout": "", "stderr": "bad request: no argv\n"}
     with _DISPATCH_LOCK:                     # serialize command execution
-        code, out, errout = _run_command(cli, argv)
-        _evict_dead(cli)
-    return {"ok": code == 0, "code": code, "stdout": out, "stderr": errout}
+        result = _run_command(cli, argv)
+        if not result.get("passthrough"):
+            _evict_dead(cli)
+    return result
 
 
 def _serve_subscribe(f, req):

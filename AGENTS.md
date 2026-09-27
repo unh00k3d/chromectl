@@ -243,6 +243,26 @@ with Client() as c:
             c.call(["replay", "--last", "--as", "b.json", "--json"])
 ```
 
+### Fast invocation with the `cx` thin client
+
+Every `chromectl` call pays Python's ~100ms interpreter+import startup, even to
+reach a warm daemon. `cx` is a tiny prebuilt Go binary that forwards your command
+to the running daemon over its socket and prints the reply — near-instant — and
+falls back to plain `chromectl` automatically when no daemon is up. Install it,
+then use `cx <args>` anywhere you'd type `chromectl <args>`:
+
+```bash
+chromectl client install            # download the binary for this OS/arch → ~/.chromectl/bin/cx
+chromectl client install --from dist/cx/   # or install from a local build dir / file
+chromectl client install --build    # or build from source (needs `go`)
+chromectl client status --json      # installed? on PATH?
+chromectl client uninstall
+cx -i work eval t "1+1"             # a drop-in for `chromectl` — uses the daemon when it's up
+```
+
+Add `~/.chromectl/bin` to your PATH (the installer prints the exact line) so a
+bare `cx` resolves. Downloads are verified against the release SHA256SUMS.
+
 ## All commands
 
 | command | usage | what |
@@ -301,3 +321,4 @@ with Client() as c:
 | `replay` | `[target] --json --burp FILE --curl FILE --har FILE --last N --index INDEX --scheme {http,https} --method METHOD --url URL --set-header 'Name: value' --remove-header NAME --body BODY --body-file FILE --as SESSION.json --vs SESSION.json --diff --engine {auto,raw,fetch} --attach TARGET --timeout TIMEOUT --out FILE --bodycap BODYCAP` | re-send a captured/imported request (Burp/curl/HAR), tampered, through the live session or out-of-band |
 | `daemon` | `[{start,stop,status}] --json --foreground` | run a resident process holding warm CDP connections |
 | `buffer` | `[{start,stop,list,subscribe}] [target] --json --maxlen MAXLEN --backlog BACKLOG --max MAX` | daemon-resident tap on live network traffic: start/stop/list, subscribe to a live stream, feed replay --last (needs --daemon) |
+| `client` | `[{install,status,uninstall}] --json --from PATH --build` | install the prebuilt `cx` thin client (fast daemon drop-in) |
