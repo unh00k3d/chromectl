@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "unh00k3d" }]
+authors = []
 keywords = ["chrome", "chromium", "cdp", "devtools", "automation", "agent", "cli", "playwright", "lighthouse", "headless"]
 classifiers = [
     "Development Status :: 4 - Beta",
