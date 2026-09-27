@@ -18,9 +18,11 @@
 // real newlines, so within a single response the only literal '\n' is the frame
 // terminator — we read bytes until the first '\n'.
 //
-// Fallback: whenever the daemon is unreachable, replies passthrough, or the
-// exchange errors, cx execs the real `chromectl` on PATH with the same args,
-// inheriting stdio and propagating its exit code.
+// This binary installs as `chromectl` (the front-facing command). Fallback:
+// whenever the daemon is unreachable, replies passthrough, or the exchange
+// errors, it execs the Python CLI `chromectl-py` on PATH with the same args,
+// inheriting stdio and propagating its exit code. The distinct fallback name
+// means it can never exec itself.
 package main
 
 import (
@@ -181,13 +183,16 @@ func readLine(r *bufio.Reader) ([]byte, error) {
 	return bytes.TrimRight(line, "\n"), nil
 }
 
-// runLocal execs the real `chromectl` on PATH with the same args, inheriting
-// stdio, and exits with the child's exit code. Uses os/exec (not syscall.Exec)
-// so the same code path builds and works on Windows.
+// runLocal execs the Python CLI `chromectl-py` on PATH with the same args,
+// inheriting stdio, and exits with the child's exit code. The fallback target is
+// deliberately a DISTINCT name from this binary (which installs as `chromectl`),
+// so there is no risk of exec'ing ourselves — no PATH-order or recursion games.
+// Uses os/exec (not syscall.Exec) so the same code path builds and works on Windows.
 func runLocal(argv []string) {
-	path, err := exec.LookPath("chromectl")
+	path, err := exec.LookPath("chromectl-py")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "cx: chromectl not found on PATH")
+		fmt.Fprintln(os.Stderr, "chromectl: chromectl-py not found on PATH "+
+			"(is the chromectl Python package installed?)")
 		os.Exit(1)
 	}
 

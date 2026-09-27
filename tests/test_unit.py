@@ -493,14 +493,14 @@ def test_client_asset_name_rejects_an_unknown_arch():
 
 
 def test_client_install_from_file_roundtrip(tmp_path, monkeypatch):
-    """--from a local file lands an executable at BIN_DIR/cx; status/uninstall agree.
+    """--from a local file lands an executable at BIN_DIR/chromectl; status/uninstall agree.
 
     Uses the local path only — the download path can't be exercised without a
     real GitHub release, so it is intentionally not tested here.
     """
     bindir = tmp_path / "bin"
     monkeypatch.setattr(cli, "BIN_DIR", str(bindir))
-    # keep the platform deterministic so the binary name is 'cx' (not cx.exe)
+    # keep the platform deterministic so the binary name is 'chromectl' (not .exe)
     monkeypatch.setattr(platform, "system", lambda: "Linux")
     monkeypatch.setattr(platform, "machine", lambda: "x86_64")
     # ensure the PATH check has something to say and never crashes
@@ -512,7 +512,7 @@ def test_client_install_from_file_roundtrip(tmp_path, monkeypatch):
     parser = cli.build_parser()
     result = cli.cmd_client(parser.parse_args(
         ["client", "install", "--from", str(fake), "--json"]))
-    dest = bindir / "cx"
+    dest = bindir / "chromectl"
     assert result["ok"] and result["source"] == "local"
     assert result["installed"] == str(dest)
     assert dest.exists() and os.access(dest, os.X_OK)
@@ -538,4 +538,4 @@ def test_client_install_from_dir_finds_the_platform_asset(tmp_path, monkeypatch)
     parser = cli.build_parser()
     result = cli.cmd_client(parser.parse_args(
         ["client", "install", "--from", str(dist), "--json"]))
-    assert result["ok"] and (tmp_path / "bin" / "cx").exists()
+    assert result["ok"] and (tmp_path / "bin" / "chromectl").exists()

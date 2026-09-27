@@ -10,3 +10,6 @@ dist/
 # stray local go builds of the cx client (release binaries go in dist/)
 client/cx/cx
 client/cx/cx.exe
+
+# build-time staging for the native client (setup.py)
+_cxbuild/

@@ -1,4 +1,9 @@
-include LICENSE
-include README.md
-include chromectl/protocol.json
-include chromectl/SKILL.md
+include LICENSE README.md AGENTS.md pyproject.toml setup.py
+include build_client.sh
+# the Go front-end source, so a source/sdist install can build the native
+# `chromectl` at install time (see setup.py)
+graft client/cx
+global-exclude *.pyc __pycache__
+prune dist
+prune build
+prune _cxbuild

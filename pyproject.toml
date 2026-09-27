@@ -47,7 +47,12 @@ Repository = "https://github.com/unh00k3d/chromectl"
 Issues = "https://github.com/unh00k3d/chromectl/issues"
 
 [project.scripts]
-chromectl = "chromectl.cli:main"
+# The Python CLI installs as `chromectl-py`. `chromectl` is added by setup.py as
+# the native Go front-end (a scripts= binary) when a Go toolchain is available at
+# build time; it forwards to the daemon and falls back to `chromectl-py`. Distinct
+# names → no PATH shadowing or self-exec. (Kept static, not dynamic: dynamic
+# scripts + a cmdclass crashes setuptools' build-requires phase.)
+chromectl-py = "chromectl.cli:main"
 
 [tool.setuptools]
 packages = ["chromectl"]

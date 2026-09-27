@@ -3785,13 +3785,16 @@ def cmd_skill(a):
 
 
 # --------------------------------------------------------------------------
-# client: a prebuilt Go "thin client" (`cx`) that talks to the daemon
+# client: the fast Go front-end that talks to the daemon
 # --------------------------------------------------------------------------
-# `cx` is a tiny statically-linked binary that forwards a command to a running
+# A tiny statically-linked binary that forwards a command to a running
 # `chromectl daemon` over its socket and prints the reply — skipping Python's
-# import cost on every call — and falls back to invoking `chromectl` when no
-# daemon is up. We only *install* it here; a separate build_client.sh cross-
-# compiles the binaries into dist/cx/ under the asset names below.
+# import cost on every call. It INSTALLS AS `chromectl` (the front-facing
+# command) and falls back to the Python CLI `chromectl-py` when no daemon is up
+# or the command can't be routed. Distinct names mean no PATH shadowing or self-
+# exec. We only *install* it here; build_client.sh cross-compiles the binaries
+# into dist/cx/ under the asset names below (built as cx-<os>-<arch>, installed
+# as `chromectl`).
 BIN_DIR = os.path.expanduser("~/.chromectl/bin")
 CLIENT_REPO = "0xenesbayram/chromectl"
 
@@ -3841,12 +3844,14 @@ def _client_asset_name(system, machine):
 
 def _client_bin_path():
     import platform
-    name = "cx.exe" if platform.system() == "Windows" else "cx"
+    # The fast client is the front-facing `chromectl`; the Python CLI installs as
+    # `chromectl-py`, which this binary falls back to (distinct names, no shadowing).
+    name = "chromectl.exe" if platform.system() == "Windows" else "chromectl"
     return os.path.join(BIN_DIR, name)
 
 
 def _client_on_path():
-    """Is ~/.chromectl/bin on PATH, so a bare `cx` resolves to what we install?"""
+    """Is ~/.chromectl/bin on PATH, so a bare `chromectl` resolves to the fast client?"""
     want = os.path.normcase(os.path.normpath(BIN_DIR))
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if entry and os.path.normcase(os.path.normpath(entry)) == want:
@@ -3889,7 +3894,7 @@ def _client_download(asset, bin_path):
 
 
 def cmd_client(a):
-    """Install / inspect / remove the prebuilt `cx` thin client."""
+    """Install / inspect / remove the fast Go client (installs as `chromectl`)."""
     import platform
     import shutil
     action = a.action or "status"
@@ -3900,12 +3905,12 @@ def cmd_client(a):
 
         def render():
             if installed:
-                console.print(f"[green]cx installed[/green] → {bin_path}")
+                console.print(f"[green]fast client installed[/green] → {bin_path}")
             else:
-                console.print("[yellow]cx not installed[/yellow] "
-                              "(chromectl client install)")
+                console.print("[yellow]fast client not installed[/yellow] "
+                              "(chromectl-py client install)")
             if not _client_on_path():
-                console.print('[dim]note: ~/.chromectl/bin is not on PATH — '
+                console.print('[dim]note: ~/.chromectl/bin must be FIRST on PATH — '
                               'export PATH="$HOME/.chromectl/bin:$PATH"[/dim]')
         return emit(a, {"ok": True, "installed": installed,
                         "path": bin_path if installed else None,
@@ -3959,12 +3964,13 @@ def cmd_client(a):
     os.chmod(bin_path, 0o755)
 
     def render():
-        console.print(f"[green]installed cx[/green] → {bin_path} [dim]({source})[/dim]")
+        console.print(f"[green]installed fast client[/green] → {bin_path} [dim]({source})[/dim]")
         if _client_on_path():
-            console.print("[dim]run it as [cyan]cx <args>[/cyan] "
-                          "(a fast drop-in for chromectl)[/dim]")
+            console.print("[dim]calls to [cyan]chromectl[/cyan] now go through the daemon "
+                          "(falling back to chromectl-py automatically)[/dim]")
         else:
-            console.print('[yellow]~/.chromectl/bin is not on PATH[/yellow] — add it:\n'
+            console.print('[yellow]put ~/.chromectl/bin FIRST on PATH[/yellow] so `chromectl` '
+                          'resolves to the fast client:\n'
                           '  export PATH="$HOME/.chromectl/bin:$PATH"')
     return emit(a, {"ok": True, "installed": bin_path, "source": source}, render)
 
@@ -4402,7 +4408,7 @@ def build_parser():
     sp.set_defaults(fn=cmd_buffer)
 
     sp = sub.add_parser("client", parents=[jsonopt],
-                        help="install the prebuilt `cx` thin client (fast daemon drop-in)")
+                        help="install the fast Go front-end (installs as `chromectl`, daemon-backed)")
     sp.add_argument("action", nargs="?", default="status",
                     choices=["install", "status", "uninstall"],
                     metavar="{install,status,uninstall}",

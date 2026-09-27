@@ -35,6 +35,21 @@ chromectl -i work run --json \
 `run --json` returns `{"ok", "steps", "failed", "results": [{step, cmd, ok, result|error}]}`.
 Add `--keep-going` to continue past a failing step.
 
+## Speed (transparent)
+
+You always call **`chromectl`** — that never changes. The install ships it as a
+tiny native front-end (alongside the Python CLI `chromectl-py`). To make it fast,
+start a resident daemon once:
+
+- **`chromectl daemon start`** — a resident process holding warm browser
+  connections. `chromectl` then forwards each command to it over a socket
+  instead of booting Python — ~5ms vs ~100ms per call.
+
+It falls back to `chromectl-py` automatically when no daemon is up or a command
+can't be routed, so `chromectl` is always safe to call. (If your build had no Go
+toolchain and only `chromectl-py` was installed, run `chromectl-py client
+install` once to add the native `chromectl`.)
+
 ## Reading a page
 
 Prefer these over `html` — they cost a fraction of the tokens:
