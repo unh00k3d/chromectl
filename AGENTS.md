@@ -253,9 +253,8 @@ routed (`watch`, `capture`, `start`, `buffer subscribe`, …). Distinct names me
 no PATH shadowing and no risk of the front-end exec'ing itself.
 
 `chromectl` is built and installed **by the normal `pipx install`** whenever a Go
-toolchain is present at build time (and it's bundled in the published wheels), so
-there is usually nothing to set up — you just type `chromectl` and start a daemon
-to make it fast:
+toolchain is present at build time, so there is usually nothing to set up — you
+just type `chromectl` and start a daemon to make it fast:
 
 ```bash
 chromectl daemon start                 # start the daemon so `chromectl` routes to it

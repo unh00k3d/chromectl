@@ -8,20 +8,15 @@ Core Web Vitals / Lighthouse, and a raw escape hatch.
 
 ## Install
 
-```bash
-pipx install chromectl                                    # from PyPI
-pipx upgrade chromectl                                    # pull later releases
-npm i -g lighthouse                                       # optional — only for `lighthouse`
-```
-
-Bleeding edge, straight from the repo:
+Install straight from the repo with pipx:
 
 ```bash
 pipx install git+https://github.com/unh00k3d/chromectl.git
 # or, from a local clone:  pipx install .
+npm i -g lighthouse                                       # optional — only for `lighthouse`
 ```
 
-pipx puts `chromectl` on your PATH in an isolated env and pulls all Python deps
+pipx puts the CLI on your PATH in an isolated env and pulls all Python deps
 (`websocket-client`, `rich`, `playwright`, `readability-lxml`, `markdownify`).
 **No `playwright install` needed** — the interaction commands *attach* to your Chrome
 over CDP rather than launching their own browser. Playwright and the read/markdown
@@ -30,21 +25,22 @@ libs are imported lazily, so the core commands stay fast.
 ### Fast by default
 
 The install ships **two** commands. `chromectl-py` is the Python CLI. `chromectl`
-is a tiny native front-end (built from `client/cx` at install time when a Go
-toolchain is present, and bundled in the published wheels) that forwards each
-command to a running daemon over a socket — **~5ms vs ~100ms of Python startup,
-~20× faster** — and falls back to `chromectl-py` automatically when no daemon is
-up or a command can't be routed. You always type `chromectl`; the speed is
-transparent. Turn it on for a session by starting the daemon once:
+is a tiny native front-end (compiled from `client/cx` at install time when a Go
+toolchain is present) that forwards each command to a running daemon over a
+socket — **~5ms vs ~100ms of Python startup, ~20× faster** — and falls back to
+`chromectl-py` automatically when no daemon is up or a command can't be routed.
+You always type `chromectl`; the speed is transparent. Turn it on for a session
+by starting the daemon once:
 
 ```bash
 chromectl daemon start              # resident process holding warm connections
 chromectl eval t "1+1" --json       # now served by the daemon; ~5ms
 ```
 
-If the build machine has no Go and you installed a source build (no bundled
-binary), only `chromectl-py` is present — run `chromectl-py client install` to
-fetch or build the native `chromectl`, and put `~/.chromectl/bin` first on PATH.
+**Install Go first** (e.g. `apt install golang` / `brew install go`) if you want
+the fast `chromectl` — without it, only `chromectl-py` is installed and you can
+add the front-end later with `chromectl-py client install --build`, then put
+`~/.chromectl/bin` first on PATH.
 
 ## 1. Launch a browser
 
