@@ -3796,7 +3796,7 @@ def cmd_skill(a):
 # into dist/cx/ under the asset names below (built as cx-<os>-<arch>, installed
 # as `chromectl`).
 BIN_DIR = os.path.expanduser("~/.chromectl/bin")
-CLIENT_REPO = "0xenesbayram/chromectl"
+CLIENT_REPO = "unh00k3d/chromectl"
 
 
 def _client_version():
