@@ -221,6 +221,8 @@ buffer — so you can replay recent requests without having armed a capture firs
 ```bash
 chromectl --daemon buffer start example        # tap the 'example' tab's network
 chromectl --daemon buffer list                 # recent requests, numbered
+chromectl --daemon buffer subscribe            # LIVE stream of requests as they happen
+chromectl --daemon buffer subscribe --backlog 20 --max 30   # last 20 then live, for 30s
 chromectl --daemon replay --last               # replay the most recent request
 chromectl --daemon replay --last 3 --as b.json # 3rd-most-recent, as another identity
 chromectl --daemon buffer stop
@@ -228,6 +230,18 @@ chromectl --daemon buffer stop
 
 Records hold the full request (method/url/headers/body) — enough to replay and
 tamper — but not response bodies, so memory stays bounded by the ring size.
+`buffer subscribe` prints each request live (as a parseable line); with `--json`
+it collects for `--max` seconds and returns one array. For a truly real-time
+agent, hold the stream open in Python and react per request:
+
+```python
+from chromectl.daemon import subscribe, Client
+with Client() as c:
+    for ev in subscribe():                      # yields events as they happen
+        tx = ev.get("tx")
+        if tx and "/api/" in tx["url"]:
+            c.call(["replay", "--last", "--as", "b.json", "--json"])
+```
 
 ## All commands
 
@@ -272,11 +286,11 @@ tamper — but not response bodies, so memory stays bounded by the ring size.
 | `forward` | `[target] --json` | go forward in history |
 | `reload` | `[target] --json --hard --timeout TIMEOUT` | reload a tab |
 | `storage` | `[target] --json --session --get KEY --set KEY=VALUE --remove KEY --clear` | read/write localStorage or sessionStorage |
-| `auth` | `<action> <file> --json --origin URL --keep-tabs` | save/load a login (cookies + per-origin web storage) |
+| `auth` | `<{save,load}> <file> --json --origin URL --keep-tabs` | save/load a login (cookies + per-origin web storage) |
 | `a11y (ax)` | `[target] --json --all --max MAX` | dump the accessibility tree (roles + names) |
 | `intercept` | `[target] --json --block PATTERN --stub PATTERN=FILE --header 'Name: value' --status STATUS --content-type CONTENT_TYPE --max MAX` | block, stub or rewrite requests (holds session) |
 | `download` | `[target] --json --dir DIR --url URL --wait WAIT --all` | arm downloads to a directory and wait |
-| `skill` | `[action] --json --dir DIR --force` | print or install the agent skill for this CLI |
+| `skill` | `[{print,install}] --json --dir DIR --force` | print or install the agent skill for this CLI |
 | `raw (cmd)` | `[target] <method> [params]` | send a raw CDP command |
 | `repl` | `[target]` | interactive CDP prompt for a target |
 | `proto` | `[query]` | look up protocol domains/commands/events |
@@ -285,5 +299,5 @@ tamper — but not response bodies, so memory stays bounded by the ring size.
 | `seo` | `[target] --json` | on-page SEO audit of a tab or URL |
 | `capture` | `[url] --json --attach TARGET --reload --type TYPE --print PRINT --out OUT --har HAR --no-bodies --bodycap BODYCAP --max MAX --quiet QUIET` | Burp-style full request/response capture |
 | `replay` | `[target] --json --burp FILE --curl FILE --har FILE --last N --index INDEX --scheme {http,https} --method METHOD --url URL --set-header 'Name: value' --remove-header NAME --body BODY --body-file FILE --as SESSION.json --vs SESSION.json --diff --engine {auto,raw,fetch} --attach TARGET --timeout TIMEOUT --out FILE --bodycap BODYCAP` | re-send a captured/imported request (Burp/curl/HAR), tampered, through the live session or out-of-band |
-| `daemon` | `[action] --json --foreground` | run a resident process holding warm CDP connections |
-| `buffer` | `[action] [target] --json --maxlen MAXLEN --max MAX` | daemon-resident ring buffer of live network traffic (for replay --last) |
+| `daemon` | `[{start,stop,status}] --json --foreground` | run a resident process holding warm CDP connections |
+| `buffer` | `[{start,stop,list,subscribe}] [target] --json --maxlen MAXLEN --backlog BACKLOG --max MAX` | daemon-resident tap on live network traffic: start/stop/list, subscribe to a live stream, feed replay --last (needs --daemon) |

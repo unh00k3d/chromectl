@@ -534,7 +534,10 @@ def _surface():
             if act.dest == "help":
                 continue
             if not act.option_strings:
-                mv = act.metavar or act.dest
+                # show explicit choices (start/stop/list/subscribe, …) so agents
+                # see the sub-actions in `cheat`, not just a bare [action]
+                mv = act.metavar or (("{" + ",".join(map(str, act.choices)) + "}")
+                                     if act.choices else act.dest)
                 if act.nargs == "?":
                     pos.append(f"[{mv}]")
                 elif act.nargs in ("+", "*"):
@@ -2445,12 +2448,47 @@ def _build_har(records, page_url):
                     "entries": entries}}
 
 
+def _buffer_subscribe(a, d):
+    """Live-stream the daemon's capture events. Runs as a client (connects to the
+    daemon socket), so it never routes into the daemon. Without --json it prints
+    events live as they arrive; with --json it collects for --max seconds and
+    returns one array (the streaming convention shared with watch/console)."""
+    if not d.is_running():
+        raise UserError("no daemon running (chromectl daemon start), then "
+                        "`chromectl --daemon buffer start TARGET`", "no-instance")
+    agent = getattr(a, "json", False)
+    events = []
+    stop = "--max" if a.max else "Ctrl-C"
+    try:
+        for ev in d.subscribe(backlog=a.backlog, max_seconds=a.max):
+            if ev.get("event") == "subscribed":
+                if not agent:
+                    tgt = ev.get("target") or "(no capture running)"
+                    console.print(Panel(f"subscribed · {tgt}  —  {stop} to stop",
+                                        border_style="cyan"))
+                continue
+            if agent:
+                events.append(ev)
+            else:
+                tx = ev.get("tx", {})
+                console.print(f"[green]{tx.get('method','?')}[/green] "
+                              f"[bold]{tx.get('status') or '-'}[/bold] "
+                              f"[dim]{tx.get('type') or ''}[/dim] {tx.get('url','')[:90]}")
+    except KeyboardInterrupt:
+        pass
+    if agent:
+        out_json({"ok": True, "count": len(events), "events": events})
+    return events
+
+
 def cmd_buffer(a):
     from chromectl import daemon as d
+    action = a.action or "list"
+    if action == "subscribe":
+        return _buffer_subscribe(a, d)        # a client-side live stream
     if not d._IN_DAEMON:
         raise UserError("the capture buffer lives in the daemon — start it "
                         "(chromectl daemon start) and route with --daemon", "bad-args")
-    action = a.action or "list"
     if action == "start":
         info = d.buffer_start(a.host, a.port, a.target, maxlen=a.maxlen)
         return emit(a, {"ok": True, **info},
@@ -2462,7 +2500,7 @@ def cmd_buffer(a):
                     lambda: console.print(f"[green]stopped[/green] {info.get('target') or ''}"
                                           if info.get("stopped") else
                                           "[yellow]no capture running[/yellow]"))
-    info = d.buffer_list(a.max)               # list
+    info = d.buffer_list(a.max or 50)         # list (0 → default 50 rows)
 
     def render():
         if not info["running"] and not info["count"]:
@@ -4164,12 +4202,18 @@ def build_parser():
     sp.set_defaults(fn=cmd_daemon)
 
     sp = sub.add_parser("buffer", parents=[jsonopt],
-                        help="daemon-resident ring buffer of live network traffic (for replay --last)")
-    sp.add_argument("action", nargs="?", choices=["start", "stop", "list"],
-                    help="start TARGET | stop | list (default list)")
+                        help="daemon-resident tap on live network traffic: start/stop/list, "
+                             "subscribe to a live stream, feed replay --last (needs --daemon)")
+    sp.add_argument("action", nargs="?", choices=["start", "stop", "list", "subscribe"],
+                    metavar="{start,stop,list,subscribe}",
+                    help="start TARGET | stop | list | subscribe (live stream); default list")
     target_arg(sp)
-    sp.add_argument("--maxlen", type=int, default=1000, help="ring size (default 1000)")
-    sp.add_argument("--max", type=int, default=50, help="how many to show in `list`")
+    sp.add_argument("--maxlen", type=int, default=1000, help="start: ring buffer size (default 1000)")
+    sp.add_argument("--backlog", type=int, default=0,
+                    help="subscribe: replay the last N buffered requests before streaming live")
+    sp.add_argument("--max", type=int, default=0,
+                    help="list: rows to show (default 50); subscribe: stop after N seconds "
+                         "(0 = until Ctrl-C)")
     sp.set_defaults(fn=cmd_buffer)
     return p
 
@@ -4220,7 +4264,10 @@ def main():
     # this is a streaming/process-management command that must run locally.
     if getattr(args, "daemon", False) or os.environ.get("CHROMECTL_DAEMON"):
         from chromectl import daemon as _d
-        if args.cmd not in _d.NON_ROUTABLE and _d.is_running():
+        # `buffer subscribe` is a client-side event stream — it must NOT route
+        # into the daemon (it connects to the daemon and reads its stream).
+        client_stream = args.cmd == "buffer" and getattr(args, "action", None) == "subscribe"
+        if args.cmd not in _d.NON_ROUTABLE and not client_stream and _d.is_running():
             sys.exit(_d.route(sys.argv[1:]))
     try:
         dispatch(args)

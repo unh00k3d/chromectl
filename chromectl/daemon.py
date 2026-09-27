@@ -13,8 +13,10 @@ one connection and issuing many commands, boot paid zero times per command).
 
 Requests:
     {"op": "ping"}                      -> {"ok": true}
-    {"op": "status"}                    -> {"ok": true, "pid", "uptime", "pooled"}
+    {"op": "status"}                    -> {"ok": true, "pid", "uptime", "pooled", ...}
     {"op": "shutdown"}                  -> {"ok": true, "shutdown": true}; server exits
+    {"op": "subscribe", "backlog": N}   -> a stream of {"event": ...} lines (live
+                                           capture events) until the client hangs up
     {"argv": ["eval", "t", "1+1", "--json"]}
         -> {"ok": bool, "code": int, "stdout": str, "stderr": str}
 """
@@ -43,10 +45,6 @@ NON_ROUTABLE = {
     "watch", "console", "logs", "intercept", "capture", "dialog", "repl",
     "run", "start", "stop", "daemon", "heapsnapshot", "heap", "download",
 }
-
-
-class _Shutdown(Exception):
-    """Raised by the shutdown op to break the accept loop cleanly."""
 
 
 # --------------------------------------------------------------------------
@@ -203,6 +201,8 @@ def spawn_background():
 _BUFFER = collections.deque(maxlen=1000)
 _BUFFER_LOCK = threading.Lock()
 _CAPTURE = None                 # {cdp, thread, stop, target, started} while running
+_SUBSCRIBERS = set()            # live subscriber queues, fed by the capture loop
+_SUB_LOCK = threading.Lock()
 
 
 def _compact(rid, r):
@@ -211,6 +211,16 @@ def _compact(rid, r):
             "method": req.get("method"), "url": req.get("url"),
             "status": r.get("status"), "mime": r.get("mime"),
             "headers": req.get("headers", {}), "body": req.get("postData")}
+
+
+def _publish(tx):
+    """Fan a recorded transaction out to live subscribers. Never blocks the
+    capture loop — a slow/dead subscriber's queue just drops on overflow."""
+    with _SUB_LOCK:
+        subs = list(_SUBSCRIBERS)
+    for q in subs:
+        with contextlib.suppress(queue.Full):
+            q.put_nowait(tx)
 
 
 def _capture_loop(conn, stop):
@@ -233,8 +243,10 @@ def _capture_loop(conn, stop):
             r["status"] = p["response"].get("status")
             r["mime"] = p["response"].get("mimeType")
             if "req" in r:                       # complete enough to replay — record it
+                tx = _compact(p["requestId"], r)
                 with _BUFFER_LOCK:
-                    _BUFFER.append(_compact(p["requestId"], r))
+                    _BUFFER.append(tx)
+                _publish(tx)
 
 
 def buffer_start(host, port, target, maxlen=1000):
@@ -294,6 +306,43 @@ def buffer_get(index):
         return None
 
 
+def subscribe(backlog=0, max_seconds=0):
+    """Client-side live stream: yield the daemon's capture events as they happen.
+
+    The real-time seam for a resident agent — open it once and react to each
+    request as it is seen, no polling:
+
+        for ev in subscribe():
+            if ev["event"] == "request" and "/api/" in ev["tx"]["url"]:
+                ...                       # e.g. replay it as another identity
+
+    Yields the {"event": "subscribed", ...} confirmation first, then a
+    {"event": "request", "tx": {...}} per request. Stops after max_seconds
+    (0 = until the caller breaks or the daemon stops)."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(SOCK)
+    f = s.makefile("rwb")
+    deadline = (time.time() + max_seconds) if max_seconds else None
+    try:
+        _send(f, {"op": "subscribe", "backlog": int(backlog)})
+        while True:
+            if deadline is not None:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return
+                s.settimeout(remaining)
+            ev = _recv(f)
+            if ev is None:                       # daemon stopped / closed
+                return
+            yield ev
+    except (OSError, socket.timeout):
+        return
+    finally:
+        with contextlib.suppress(Exception):
+            f.close()
+            s.close()
+
+
 # --------------------------------------------------------------------------
 # server side
 # --------------------------------------------------------------------------
@@ -333,43 +382,93 @@ def _run_command(cli, argv):
     return code, out.getvalue(), errbuf.getvalue()
 
 
+# Commands run one at a time under this lock (the connection pool and the
+# per-request stdout redirect are process-global); subscribe streams run outside
+# it, concurrently, so a live subscriber never blocks command service.
+_DISPATCH_LOCK = threading.Lock()
+_STOP = threading.Event()
+_SRV = None                     # the listening socket, so shutdown can unblock accept()
+
+
 def _process(req, cli, started):
     """Turn one request into one response dict. A 'shutdown' response also
-    carries {"shutdown": true} so the loop knows to break after replying."""
+    carries {"shutdown": true} so the caller knows to stop the server."""
     op = req.get("op")
     if op == "ping":
         return {"ok": True}
     if op == "status":
         return {"ok": True, "pid": os.getpid(),
                 "uptime": round(time.time() - started, 1),
-                "pooled": len(cli._RUN_POOL)}
+                "pooled": len(cli._RUN_POOL), "capturing": bool(_CAPTURE),
+                "subscribers": len(_SUBSCRIBERS)}
     if op == "shutdown":
         return {"ok": True, "shutdown": True}
     argv = req.get("argv")
     if argv is None:
         return {"ok": False, "code": 2, "stdout": "", "stderr": "bad request: no argv\n"}
-    code, out, errout = _run_command(cli, argv)
-    _evict_dead(cli)
+    with _DISPATCH_LOCK:                     # serialize command execution
+        code, out, errout = _run_command(cli, argv)
+        _evict_dead(cli)
     return {"ok": code == 0, "code": code, "stdout": out, "stderr": errout}
 
 
-def _handle(conn, cli, started):
-    """Serve one connection: handle requests until the client disconnects.
+def _serve_subscribe(f, req):
+    """Stream capture events to one subscriber until it disconnects or we stop.
 
-    Persistent — a resident Client sends many requests over one connection, so
-    we loop until EOF. One-shot CLI helpers just send a single request and hang
-    up, which reads as EOF on the next iteration."""
+    Runs in its own connection thread and holds no dispatch lock, so commands
+    (and other subscribers) keep flowing while it streams."""
+    q = queue.Queue(maxsize=1000)
+    with _SUB_LOCK:
+        _SUBSCRIBERS.add(q)
+    try:
+        _send(f, {"event": "subscribed", "capturing": bool(_CAPTURE),
+                  "target": _CAPTURE["target"] if _CAPTURE else None})
+        backlog = int(req.get("backlog") or 0)
+        if backlog:
+            with _BUFFER_LOCK:
+                recent = list(_BUFFER)[-backlog:]
+            for tx in recent:
+                _send(f, {"event": "request", "tx": tx})
+        while not _STOP.is_set():
+            try:
+                tx = q.get(timeout=0.5)
+            except queue.Empty:
+                continue                     # loop so _STOP is noticed promptly
+            _send(f, {"event": "request", "tx": tx})
+    except OSError:
+        pass                                 # subscriber hung up
+    finally:
+        with _SUB_LOCK:
+            _SUBSCRIBERS.discard(q)
+        with contextlib.suppress(Exception):
+            f.close()
+
+
+def _handle(conn, cli, started):
+    """Serve one connection (in its own thread) until the client disconnects.
+
+    A `subscribe` op turns the connection into a one-way event stream; every
+    other request is the usual request/response, and many can share one
+    connection (the persistent Client)."""
     conn.settimeout(None)
     f = conn.makefile("rwb")
     try:
         while True:
             req = _recv(f)
-            if req is None:                 # client hung up
+            if req is None:                  # client hung up
+                return
+            if req.get("op") == "subscribe":
+                _serve_subscribe(f, req)     # streams until disconnect
                 return
             resp = _process(req, cli, started)
             _send(f, resp)
             if resp.get("shutdown"):
-                raise _Shutdown()
+                _STOP.set()
+                with contextlib.suppress(Exception):
+                    _SRV.close()             # unblock the accept loop
+                return
+    except OSError:
+        pass                                 # a client that hung up mid-request
     finally:
         with contextlib.suppress(Exception):
             f.close()
@@ -384,45 +483,58 @@ def _evict_dead(cli):
 
 
 def serve():
-    """Run the accept loop until a shutdown op or signal. Blocks."""
-    global _IN_DAEMON
+    """Run the accept loop until a shutdown op. Blocks. One thread per
+    connection: commands are serialized by _DISPATCH_LOCK; subscribe streams run
+    concurrently so they never block command service."""
+    global _IN_DAEMON, _SRV
     import chromectl.cli as cli
     os.makedirs(_DIR, exist_ok=True)
     if is_running():
         raise cli.UserError("daemon already running", "exists")
     if os.path.exists(SOCK):                # stale socket from a crash
         os.unlink(SOCK)
+    _STOP.clear()
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(SOCK)
     os.chmod(SOCK, 0o600)                   # user-only; no network exposure
     srv.listen(16)
+    _SRV = srv
     with open(PIDFILE, "w") as f:
         f.write(str(os.getpid()))
     cli._RUN_ACTIVE = True                  # make connect() pool into cli._RUN_POOL
     _IN_DAEMON = True
     started = time.time()
     try:
-        while True:
-            conn, _ = srv.accept()
+        while not _STOP.is_set():
             try:
-                _handle(conn, cli, started)
-            except _Shutdown:
-                break
+                conn, _ = srv.accept()
             except OSError:
-                pass                        # a client that hung up mid-request
-            finally:
-                conn.close()
+                break                       # socket closed by shutdown
+            threading.Thread(target=_handle, args=(conn, cli, started),
+                             daemon=True).start()
     finally:
+        _STOP.set()
         _IN_DAEMON = False
         with contextlib.suppress(Exception):
             buffer_stop()
+        with _SUB_LOCK:
+            _SUBSCRIBERS.clear()
         cli._RUN_ACTIVE = False         # don't leak pooling into anything else
-        srv.close()
+        with contextlib.suppress(Exception):
+            srv.close()
+        _SRV = None
         for c in list(cli._RUN_POOL.values()):
             c._pooled = False
             with contextlib.suppress(Exception):
                 c.close()
         cli._RUN_POOL.clear()
-        for path in (SOCK, PIDFILE):
-            with contextlib.suppress(OSError):
-                os.unlink(path)
+        # Only remove the socket/pidfile if they're still ours: on a rapid
+        # stop→start, a newer daemon may already own them, and a blind unlink
+        # here would delete the live one's files out from under it.
+        mine = False
+        with contextlib.suppress(OSError, ValueError):
+            mine = open(PIDFILE).read().strip() == str(os.getpid())
+        if mine:
+            for path in (SOCK, PIDFILE):
+                with contextlib.suppress(OSError):
+                    os.unlink(path)

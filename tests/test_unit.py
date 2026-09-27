@@ -414,6 +414,42 @@ def test_buffer_and_replay_last_refuse_outside_the_daemon():
     assert e2.value.kind == "bad-args"
 
 
+def test_daemon_subscribe_streams_events_concurrently(tmp_path, monkeypatch):
+    """A subscriber receives the confirmation then live events, and command
+    requests still work while it streams (per-connection threads)."""
+    import threading
+    import time
+
+    from chromectl import daemon as d
+
+    monkeypatch.setattr(d, "_DIR", str(tmp_path))
+    monkeypatch.setattr(d, "SOCK", str(tmp_path / "daemon.sock"))
+    monkeypatch.setattr(d, "PIDFILE", str(tmp_path / "daemon.pid"))
+
+    threading.Thread(target=d.serve, daemon=True).start()
+    for _ in range(60):
+        if d.is_running():
+            break
+        time.sleep(0.05)
+    assert d.is_running()
+
+    got = []
+    listener = threading.Thread(target=lambda: got.extend(d.subscribe(max_seconds=2)))
+    listener.start()
+    time.sleep(0.3)                          # let the subscription register
+
+    # a command still runs while a subscriber is streaming (concurrency)
+    with d.Client() as c:
+        assert c.call(["cheat", "--json"])["code"] == 0
+
+    d._publish({"method": "GET", "url": "https://t/x", "status": 200, "type": "xhr"})
+    listener.join(timeout=3)
+
+    assert got and got[0]["event"] == "subscribed"
+    assert any(e.get("event") == "request" and e["tx"]["url"] == "https://t/x" for e in got)
+    assert d.stop() is True
+
+
 def test_buffer_records_and_indexing(monkeypatch):
     """buffer_list summarizes and buffer_get indexes the ring (newest = -1)."""
     import collections
