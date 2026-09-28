@@ -261,6 +261,28 @@ def test_user_flags_still_win_for_an_app():
     assert "--user-data-dir=/tmp/x" in flags
 
 
+def test_stealth_adds_launch_flags_but_leaves_the_ua_alone():
+    flags = cli._launch_flags(_launch_args(stealth=True), 9222, "/tmp/p")
+    assert "--disable-blink-features=AutomationControlled" in flags
+    assert "--window-size=1920,1080" in flags
+    # UA is left honest on purpose — no --user-agent under --stealth
+    assert not any(f.startswith("--user-agent") for f in flags)
+
+
+def test_stealth_is_off_by_default_and_skipped_for_apps():
+    plain = cli._launch_flags(_launch_args(), 9222, "/tmp/p")
+    assert "--disable-blink-features=AutomationControlled" not in plain
+    app = cli._launch_flags(_launch_args(app="/usr/bin/slack", stealth=True), 9333, None)
+    assert app == ["--remote-debugging-port=9333"]     # an app gets only the port
+
+
+def test_user_window_size_still_wins_over_stealth():
+    flags = cli._launch_flags(
+        _launch_args(stealth=True, chrome_arg=["--window-size=640,480"]), 9222, "/tmp/p")
+    assert "--window-size=640,480" in flags
+    assert "--window-size=1920,1080" not in flags
+
+
 # --- the instance registry ------------------------------------------------
 def test_registry_roundtrip_and_lookup(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "STATE_FILE", str(tmp_path / "instances.json"))

@@ -346,6 +346,238 @@ def subscribe(backlog=0, max_seconds=0):
 
 
 # --------------------------------------------------------------------------
+# resident hooks — scripts injected before any page script on every target.
+# Mirrors the capture buffer: one BROWSER-level CDP connection with auto-attach,
+# and a background thread that keeps the registered hooks applied to every current
+# and future page/webview session. This survives navigations and new tabs, which a
+# per-connection `hook` in the CLI cannot. See cli.STEALTH_JS.
+#
+# Two CDP realities shape the design (both verified against Chrome):
+#   * Browser-level auto-attach does NOT attach to tabs that already exist — we
+#     attach to those explicitly, register the script, and DON'T reload them
+#     (never yank a page out from under the user; their next navigation is hooked).
+#   * A tab created with a URL (`open URL`) commits its first document before we
+#     can register, so that first load misses the script. We detect it (the tab is
+#     new and already at a real URL when we attach) and reload once — the reload's
+#     document carries the hook. A tab created blank then navigated needs no reload.
+#
+# The attach thread is the SOLE owner of its CDP connection (conn.call there
+# competes with nothing), so dispatch-thread entry points only mutate the shared
+# registry + a pending-removal list under _HOOK_LOCK and let the thread reconcile.
+# --------------------------------------------------------------------------
+_HOOKS = collections.OrderedDict()   # id -> source           (dispatch thread writes, locked)
+_HOOK_REMOVE = []                    # ids pending removal     (dispatch thread appends, locked)
+_HOOK_LOCK = threading.Lock()
+_HOOK_ATTACH = None                  # {cdp, thread, stop} while active
+_HOOK_IDENT = {}                     # id -> {sessionId: script identifier}  (attach thread owns)
+_HOOK_SESSIONS = {}                  # sessionId -> targetId                 (attach thread owns)
+_HOOK_PREEXISTING = set()            # targetIds present when we attached (never reload these)
+_HOOK_RELOADED = set()               # sessionIds already reloaded once (avoid loops)
+_HOOK_SEQ = 0
+
+
+def _hook_new_id():
+    global _HOOK_SEQ
+    _HOOK_SEQ += 1
+    return f"h{_HOOK_SEQ}"
+
+
+def _hook_drain(conn, timeout):
+    """Next CDP message, buffered-events-first so conn.call()'s leftovers are seen."""
+    if conn.buf:
+        return conn.buf.pop(0)
+    try:
+        return conn.q.get(timeout=timeout)
+    except queue.Empty:
+        return None
+
+
+def _hook_reconcile(conn):
+    """Register any (hook, session) pair not yet applied and process removals.
+
+    Attach-thread only, so conn has a single owner here."""
+    with _HOOK_LOCK:
+        hooks = list(_HOOKS.items())
+        removing = list(_HOOK_REMOVE)
+    for hid, source in hooks:
+        seen = _HOOK_IDENT.setdefault(hid, {})
+        for sid in list(_HOOK_SESSIONS):
+            if sid in seen:
+                continue
+            try:
+                r = conn.call("Page.addScriptToEvaluateOnNewDocument",
+                              {"source": source}, session_id=sid)
+                seen[sid] = r.get("identifier")
+            except Exception:
+                pass
+    if removing:
+        for hid in removing:
+            for sid, ident in list(_HOOK_IDENT.get(hid, {}).items()):
+                with contextlib.suppress(Exception):
+                    conn.call("Page.removeScriptToEvaluateOnNewDocument",
+                              {"identifier": ident}, session_id=sid)
+            _HOOK_IDENT.pop(hid, None)
+        with _HOOK_LOCK:
+            for hid in removing:
+                _HOOKS.pop(hid, None)
+                if hid in _HOOK_REMOVE:
+                    _HOOK_REMOVE.remove(hid)
+
+
+def _hook_missed_first_load(target_id, session_id, url):
+    """A brand-new tab already sitting at a real URL when we attached — its first
+    document loaded before the script was registered, so reload once to apply it."""
+    if target_id in _HOOK_PREEXISTING or session_id in _HOOK_RELOADED:
+        return False
+    return bool(url) and url != "about:blank" and not url.startswith("chrome://")
+
+
+def _hook_attach_loop(conn, stop):
+    try:
+        while not stop.is_set():
+            _hook_reconcile(conn)
+            m = _hook_drain(conn, 0.1)
+            if m is None:
+                continue
+            if "__error__" in m:
+                break
+            method, p = m.get("method"), m.get("params", {})
+            if method == "Target.attachedToTarget":
+                sid, ti = p.get("sessionId"), p.get("targetInfo", {})
+                tid, turl = ti.get("targetId"), ti.get("url", "")
+                if ti.get("type") in ("page", "webview"):
+                    _HOOK_SESSIONS[sid] = tid
+                    with contextlib.suppress(Exception):
+                        conn.call("Page.enable", session_id=sid)
+                    _hook_reconcile(conn)          # register before the page runs (blank tabs)
+                    if _hook_missed_first_load(tid, sid, turl):
+                        _HOOK_RELOADED.add(sid)
+                        with contextlib.suppress(Exception):
+                            conn.call("Page.reload", session_id=sid)   # apply to the first load
+                # resume the target whether or not we hook it (it may have paused on start)
+                with contextlib.suppress(Exception):
+                    conn.call("Runtime.runIfWaitingForDebugger", session_id=sid)
+            elif method == "Target.detachedFromTarget":
+                sid = p.get("sessionId")
+                _HOOK_SESSIONS.pop(sid, None)
+                _HOOK_RELOADED.discard(sid)
+                for seen in _HOOK_IDENT.values():
+                    seen.pop(sid, None)
+    finally:
+        with contextlib.suppress(Exception):
+            conn.call("Target.setAutoAttach",
+                      {"autoAttach": False, "waitForDebuggerOnStart": False, "flatten": True},
+                      timeout=5)
+        with contextlib.suppress(Exception):
+            conn.close()
+        _HOOK_SESSIONS.clear()
+        _HOOK_IDENT.clear()
+        _HOOK_PREEXISTING.clear()
+        _HOOK_RELOADED.clear()
+
+
+def _hook_ensure_attached(host, port):
+    global _HOOK_ATTACH
+    if _HOOK_ATTACH:
+        return
+    import chromectl.cli as cli
+    conn = cli.CDP(cli.browser_ws(host, port))
+    # Snapshot the tabs open right now: auto-attach won't report them, and we must
+    # NOT reload them (they're the user's, mid-task). Then enable auto-attach for
+    # every FUTURE tab and explicitly attach to each pre-existing one. All of this
+    # is synchronous so a tab opened right after hook_add is already covered; stray
+    # attachedToTarget events buffer on conn and the loop drains them once it owns it.
+    _HOOK_PREEXISTING.clear()
+    _HOOK_RELOADED.clear()
+    with contextlib.suppress(Exception):
+        for t in cli.list_targets(host, port):
+            if t.get("type") in ("page", "webview"):
+                _HOOK_PREEXISTING.add(t["id"])
+    conn.call("Target.setAutoAttach",
+              {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True})
+    for tid in list(_HOOK_PREEXISTING):
+        with contextlib.suppress(Exception):
+            conn.call("Target.attachToTarget", {"targetId": tid, "flatten": True})
+    stop = threading.Event()
+    th = threading.Thread(target=_hook_attach_loop, args=(conn, stop), daemon=True)
+    _HOOK_ATTACH = {"cdp": conn, "thread": th, "stop": stop}
+    th.start()
+
+
+def _hook_maybe_detach():
+    """Tear the auto-attach connection down once nothing is registered."""
+    global _HOOK_ATTACH
+    with _HOOK_LOCK:
+        empty = not _HOOKS
+    if empty and _HOOK_ATTACH:
+        _HOOK_ATTACH["stop"].set()          # the attach thread closes conn on exit
+        _HOOK_ATTACH = None
+
+
+def _hook_wait(pred, timeout=2.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline and not pred():
+        time.sleep(0.05)
+
+
+def hook_add(host, port, source, hook_id=None):
+    """Register a hook and (re)apply it to every current and future target."""
+    import chromectl.cli as cli
+    if not _IN_DAEMON:
+        raise cli.UserError("resident hooks need the daemon "
+                            "(chromectl daemon start; then --daemon)", "bad-args")
+    hid = hook_id or _hook_new_id()
+    with _HOOK_LOCK:
+        _HOOKS[hid] = source
+    _hook_ensure_attached(host, port)
+    # let the attach thread apply to the tabs open right now, for an honest count
+    _hook_wait(lambda: len(_HOOK_IDENT.get(hid, {})) >= len(_HOOK_SESSIONS))
+    return {"id": hid, "sessions": len(_HOOK_IDENT.get(hid, {}))}
+
+
+def hook_remove(hook_id):
+    with _HOOK_LOCK:
+        exists = hook_id in _HOOKS
+        if exists and hook_id not in _HOOK_REMOVE:
+            _HOOK_REMOVE.append(hook_id)
+    if not exists:
+        return {"removed": False, "id": hook_id}
+    _hook_wait(lambda: hook_id not in _HOOKS)
+    _hook_maybe_detach()
+    return {"removed": True, "id": hook_id}
+
+
+def hook_clear():
+    with _HOOK_LOCK:
+        ids = list(_HOOKS)
+        for hid in ids:
+            if hid not in _HOOK_REMOVE:
+                _HOOK_REMOVE.append(hid)
+    if ids:
+        _hook_wait(lambda: not _HOOKS)
+    _hook_maybe_detach()
+    return {"removed": len(ids)}
+
+
+def hook_list():
+    with _HOOK_LOCK:
+        items = list(_HOOKS.items())
+    hooks = [{"id": hid, "source": src, "sessions": len(_HOOK_IDENT.get(hid, {}))}
+             for hid, src in items]
+    return {"running": bool(_HOOK_ATTACH), "targets": len(_HOOK_SESSIONS), "hooks": hooks}
+
+
+def hook_shutdown():
+    global _HOOK_ATTACH
+    if _HOOK_ATTACH:
+        _HOOK_ATTACH["stop"].set()
+        _HOOK_ATTACH = None
+    with _HOOK_LOCK:
+        _HOOKS.clear()
+        _HOOK_REMOVE.clear()
+
+
+# --------------------------------------------------------------------------
 # server side
 # --------------------------------------------------------------------------
 _PARSER = None
@@ -421,7 +653,7 @@ def _process(req, cli, started):
         return {"ok": True, "pid": os.getpid(),
                 "uptime": round(time.time() - started, 1),
                 "pooled": len(cli._RUN_POOL), "capturing": bool(_CAPTURE),
-                "subscribers": len(_SUBSCRIBERS)}
+                "subscribers": len(_SUBSCRIBERS), "hooks": len(_HOOKS)}
     if op == "shutdown":
         return {"ok": True, "shutdown": True}
     argv = req.get("argv")
@@ -539,6 +771,8 @@ def serve():
         _IN_DAEMON = False
         with contextlib.suppress(Exception):
             buffer_stop()
+        with contextlib.suppress(Exception):
+            hook_shutdown()
         with _SUB_LOCK:
             _SUBSCRIBERS.clear()
         cli._RUN_ACTIVE = False         # don't leak pooling into anything else

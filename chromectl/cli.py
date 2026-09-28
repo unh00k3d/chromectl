@@ -793,6 +793,14 @@ def _launch_flags(a, port, profile):
         flags.append(f"--user-data-dir={profile}")
     if not getattr(a, "app", None):
         flags += ["--no-first-run", "--no-default-browser-check", "--remote-allow-origins=*"]
+        if getattr(a, "stealth", False):
+            # Drop the biggest automation tells at launch: --disable-blink-features
+            # stops Blink setting navigator.webdriver (and suppresses the infobar),
+            # and a real window size hides the 800x600 headless default. The JS
+            # fingerprints are handled separately by `hook stealth` (STEALTH_JS).
+            # The User-Agent is left honest on purpose (no --user-agent here).
+            flags += ["--disable-blink-features=AutomationControlled",
+                      "--window-size=1920,1080"]
         if not a.headful:
             flags.insert(0, "--headless=new")
     return _merge_chrome_flags(flags, _extra_chrome_args(a))
@@ -937,10 +945,16 @@ def cmd_start(a):
                                   "signed-in session — anyone who reaches the debug port is you. "
                                   "Keep it on localhost.")
                 console.print(f"[dim]target it with:  chromectl -i {name} <cmd>   (or --port {port})[/dim]")
+                if getattr(a, "stealth", False):
+                    console.print(f"[dim]stealth flags on; add the JS layer with:  "
+                                  f"chromectl --daemon hook stealth   (resident, all tabs)  or, "
+                                  f"in a run:  chromectl -i {name} run "
+                                  f"--step 'open about:blank' --step 'hook stealth' --step 'goto URL'[/dim]")
 
             return emit(a, {"ok": True, "name": name, "host": a.host, "port": port,
                             "pid": proc.pid, "kind": kind, "browser": browser,
-                            "profile": profile, "binary": binary}, render)
+                            "profile": profile, "binary": binary,
+                            "stealth": bool(getattr(a, "stealth", False))}, render)
         if proc.poll() is not None:            # it died, or handed off and exited
             break
         time.sleep(0.3)
@@ -1788,6 +1802,119 @@ VITALS_JS = r"""(() => {
     if (n) window.__v.ttfb = n.responseStart; return window.__v; };
 })()"""
 
+# The stealth bundle: patches the runtime JS fingerprints that only an automated /
+# headless Chrome leaks, so ordinary sites don't switch behaviour on us. Registered
+# via Page.addScriptToEvaluateOnNewDocument so it runs before the page's own scripts,
+# in every frame. Every patch is guarded, idempotent and never throws.
+#
+# Two rules learned from probing real Chrome:
+#   * Only patch what is actually wrong. Modern (new-headless) Chrome already ships
+#     real plugins, window.chrome, languages and consistent permissions — patching
+#     those anyway would REPLACE an authentic value with a detectable fake. Each
+#     patch is guarded to fire only on the broken/headless signature.
+#   * A patched native must still look native. Overriding a function changes its
+#     .toString() to reveal our source, which is itself a tell — so we install a
+#     toString mask and route every patched function through it.
+#
+# Deliberately does NOT touch the User-Agent (it stays honest, incl. the
+# HeadlessChrome token). navigator.userAgentData brands are already clean. This
+# defeats common fingerprint checks, not a determined adversary; CDP attachment
+# itself still has side-channels.
+STEALTH_JS = r"""(() => {
+  // ---- make patched functions report [native code] via .toString() ----
+  const origToString = Function.prototype.toString;
+  const masks = new WeakMap();
+  const nativeStr = (name) => 'function ' + name + '() { [native code] }';
+  function toString() { return masks.has(this) ? masks.get(this) : origToString.call(this); }
+  masks.set(toString, origToString.call(origToString));   // the mask must look native too
+  try { Function.prototype.toString = toString; } catch (e) {}
+  const mask = (fn, name) => { try { masks.set(fn, nativeStr(name)); } catch (e) {} return fn; };
+  const def = (o, k, get) => {
+    try { mask(get, 'get ' + k); Object.defineProperty(o, k, {get, configurable:true, enumerable:true}); } catch (e) {}
+  };
+
+  // navigator.webdriver: only when it is actually true (real automation). New
+  // headless already reports false-on-prototype, which is what a normal browser
+  // does — leave it, don't add a tell-tale own getter returning undefined.
+  try { if (navigator.webdriver === true) def(Navigator.prototype, 'webdriver', () => false); } catch (e) {}
+
+  // window.chrome: only if missing (old headless). New headless has the real one.
+  try { if (!window.chrome) window.chrome = { runtime: {} }; } catch (e) {}
+
+  // languages: only if empty (old headless reported []).
+  try { if (!navigator.languages || !navigator.languages.length)
+      def(navigator, 'languages', () => ['en-US', 'en']); } catch (e) {}
+
+  // plugins/mimeTypes: only if empty. (A synthesized list is imperfect, but an
+  // empty one is a certain tell; modern Chrome ships a real list so this no-ops.)
+  try {
+    if (!navigator.plugins || navigator.plugins.length === 0) {
+      const data = [
+        {name:'PDF Viewer', filename:'internal-pdf-viewer', desc:'Portable Document Format'},
+        {name:'Chrome PDF Viewer', filename:'internal-pdf-viewer', desc:'Portable Document Format'},
+        {name:'Chromium PDF Viewer', filename:'internal-pdf-viewer', desc:'Portable Document Format'},
+      ];
+      const mimes = [];
+      const plugins = data.map(d => {
+        const m = {type:'application/pdf', suffixes:'pdf', description:d.desc};
+        const p = {name:d.name, filename:d.filename, description:d.desc, length:1, 0:m};
+        m.enabledPlugin = p; mimes.push(m); return p;
+      });
+      def(navigator, 'plugins', () => plugins);
+      def(navigator, 'mimeTypes', () => mimes);
+    }
+  } catch (e) {}
+
+  // permissions.query: fix ONLY the classic headless mismatch (Notification.permission
+  // === 'denied' while query would say 'prompt'). New headless is consistent, so skip.
+  try {
+    const q = navigator.permissions && navigator.permissions.query;
+    if (q && typeof Notification !== 'undefined' && Notification.permission === 'denied') {
+      const patched = function query(p) {
+        return (p && p.name === 'notifications')
+          ? Promise.resolve({state: Notification.permission, onchange: null})
+          : q.call(navigator.permissions, p);
+      };
+      navigator.permissions.query = mask(patched, 'query');
+    }
+  } catch (e) {}
+
+  // WebGL: only rewrite the UNMASKED vendor/renderer when the GPU is software
+  // (SwiftShader / llvmpipe / ANGLE-Software) — never lie about a real GPU.
+  try {
+    const probe = document.createElement('canvas').getContext('webgl');
+    const ext = probe && probe.getExtension('WEBGL_debug_renderer_info');
+    const cur = ext ? String(probe.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : '';
+    if (/swiftshader|llvmpipe|software|subzero/i.test(cur)) {
+      const patch = (proto) => {
+        if (!proto) return;
+        const orig = proto.getParameter;
+        const patched = function getParameter(p) {
+          if (p === 37445) return 'Intel Inc.';                 // UNMASKED_VENDOR_WEBGL
+          if (p === 37446) return 'Intel Iris OpenGL Engine';   // UNMASKED_RENDERER_WEBGL
+          return orig.call(this, p);
+        };
+        proto.getParameter = mask(patched, 'getParameter');
+      };
+      patch(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+      patch(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+    }
+  } catch (e) {}
+
+  // screen: headless reports 800x600 regardless of window size, which contradicts a
+  // larger window. Only correct the tiny default; leave a real display alone.
+  try {
+    if (screen.width <= 800 && screen.height <= 600) {
+      const w = Math.max(window.outerWidth || 0, window.innerWidth || 0, 1920);
+      const h = Math.max(window.outerHeight || 0, window.innerHeight || 0, 1080);
+      def(Screen.prototype, 'width', () => w);
+      def(Screen.prototype, 'height', () => h);
+      def(Screen.prototype, 'availWidth', () => w);
+      def(Screen.prototype, 'availHeight', () => h);
+    }
+  } catch (e) {}
+})()"""
+
 # metric -> (good_max, needs_max, unit) per web.dev thresholds
 VITAL_THRESH = {
     "LCP": (2500, 4000, "ms"), "CLS": (0.1, 0.25, ""), "INP": (200, 500, "ms"),
@@ -2514,6 +2641,124 @@ def cmd_buffer(a):
         for x in info["transactions"]:
             tbl.add_row(str(x["i"]), x["method"] or "?", str(x["status"] or "-"),
                         x["type"] or "", (x["url"] or "")[:80])
+        console.print(tbl)
+    return emit(a, {"ok": True, **info}, render)
+
+
+# `hook --wrap NAME` recipes: register a before-any-script patch that logs every
+# call to a common API through console.log, so `chromectl console` tails it live.
+WRAP_RECIPES = {
+    "fetch": r"""(() => { const o = window.fetch; if (!o || o.__cxwrapped) return;
+      const w = function (...a) { try { console.log('[hook:fetch]',
+        (a[0] && a[0].url) || a[0], (a[1] && a[1].method) || 'GET'); } catch (e) {}
+        return o.apply(this, a); };
+      w.__cxwrapped = true; window.fetch = w; })()""",
+    "xhr": r"""(() => { const o = XMLHttpRequest.prototype.open; if (!o || o.__cxwrapped) return;
+      const w = function (m, u, ...r) { try { console.log('[hook:xhr]', m, u); } catch (e) {}
+        return o.call(this, m, u, ...r); };
+      w.__cxwrapped = true; XMLHttpRequest.prototype.open = w; })()""",
+}
+
+
+def _hook_source(a):
+    """Resolve the script a `hook add` should register: --wrap, --file, or --source."""
+    if getattr(a, "wrap", None):
+        recipe = WRAP_RECIPES.get(a.wrap)
+        if not recipe:
+            raise UserError(f"unknown --wrap {a.wrap!r} (known: {', '.join(WRAP_RECIPES)})",
+                            "bad-args")
+        return recipe
+    if getattr(a, "file", None):
+        try:
+            with open(a.file) as f:
+                return f.read()
+        except OSError as e:
+            raise UserError(str(e), "not-found") from None
+    if getattr(a, "source", None):
+        return a.source
+    raise UserError("hook add needs --source, --file, or --wrap", "bad-args")
+
+
+def cmd_hook(a):
+    """Register a script that runs before any page script, on every new document.
+
+    The one primitive (Page.addScriptToEvaluateOnNewDocument) behind both the
+    stealth patches and generic API hooking. Two homes:
+
+    * local / inside `run` (no --daemon): applied to ONE tab over the current
+      connection. It lives only as long as that connection, so it is useful inside
+      a `run` (pooled) and ephemeral one-shot. Because it only affects a tab's
+      FUTURE documents, register it on a tab you already have, then navigate — e.g.
+      `run --step 'open about:blank' --step 'hook stealth' --step 'goto URL'`.
+    * daemon-resident (--daemon): kept in a registry and re-applied to every current
+      and future target via browser-level auto-attach, so it survives one-shot
+      calls, navigations and new tabs.
+    """
+    from chromectl import daemon as d
+    action = a.action or "list"
+    if d._IN_DAEMON:
+        return _hook_daemon(a, d, action)
+    if action in ("add", "stealth"):
+        source = STEALTH_JS if action == "stealth" else _hook_source(a)
+        c, t = connect(a.host, a.port, a.target)
+        try:
+            c.call("Page.enable")
+            r = c.call("Page.addScriptToEvaluateOnNewDocument", {"source": source})
+            ident = r.get("identifier")
+        finally:
+            c.close()                    # a no-op while pooled inside `run`
+        ephemeral = not _RUN_ACTIVE
+
+        def render():
+            console.print(f"[green]hook added[/green] "
+                          f"{'(stealth) ' if action == 'stealth' else ''}[dim]{ident}[/dim]")
+            if ephemeral:
+                console.print("[yellow]note:[/yellow] this hook lives only for this "
+                              "connection — register it inside `run`, or with `--daemon`, "
+                              "to persist across navigations and tabs.")
+            else:
+                console.print("[dim]affects this tab's next navigation; open/goto after this "
+                              "step, or reload.[/dim]")
+        return emit(a, {"ok": True, "identifier": ident, "kind": action,
+                        "ephemeral": ephemeral}, render)
+    raise UserError(f"`hook {action}` needs the resident registry — start the daemon "
+                    f"(chromectl daemon start) and route with --daemon", "bad-args")
+
+
+def _hook_daemon(a, d, action):
+    """The --daemon side of `hook`: a resident registry + browser-level auto-attach."""
+    if action in ("add", "stealth"):
+        source = STEALTH_JS if action == "stealth" else _hook_source(a)
+        hid = "stealth" if action == "stealth" else getattr(a, "id", None)
+        info = d.hook_add(a.host, a.port, source, hook_id=hid)
+        return emit(a, {"ok": True, **info}, lambda: console.print(
+            f"[green]hook registered[/green] [bold]{info['id']}[/bold] "
+            f"[dim](applied to {info['sessions']} live target(s); auto-applies to new ones)[/dim]"))
+    if action == "remove":
+        if not getattr(a, "id", None):
+            raise UserError("hook remove needs an ID (see: chromectl --daemon hook list)", "bad-args")
+        info = d.hook_remove(a.id)
+        return emit(a, {"ok": info["removed"], **info}, lambda: console.print(
+            f"[green]removed[/green] {a.id}" if info["removed"]
+            else f"[yellow]no such hook[/yellow] {a.id}"))
+    if action == "clear":
+        info = d.hook_clear()
+        return emit(a, {"ok": True, **info},
+                    lambda: console.print(f"[green]cleared[/green] {info['removed']} hook(s)"))
+    info = d.hook_list()                  # list
+
+    def render():
+        if not info["hooks"]:
+            console.print("[yellow]no hooks registered[/yellow] "
+                          "(chromectl --daemon hook stealth)")
+            return
+        tbl = Table(header_style="bold cyan")
+        for col in ("id", "targets", "source"):
+            tbl.add_column(col)
+        for h in info["hooks"]:
+            src = h["source"].replace("\n", " ")
+            tbl.add_row(h["id"], str(h["sessions"]),
+                        (src[:70] + "…") if len(src) > 70 else src)
         console.print(tbl)
     return emit(a, {"ok": True, **info}, render)
 
@@ -4013,6 +4258,9 @@ def build_parser():
     sp.add_argument("--ephemeral", action="store_true",
                     help="use a throwaway profile in /tmp (no persistence) instead of the default")
     sp.add_argument("--headful", action="store_true", help="show the window")
+    sp.add_argument("--stealth", action="store_true",
+                    help="drop automation tells at launch (navigator.webdriver, infobar, "
+                         "headless window size); pair with `hook stealth` for the JS layer")
     sp.add_argument("--binary", help="path to a Chrome/Chromium binary")
     sp.add_argument("--app", metavar="PATH",
                     help="launch any Electron-based app instead of Chrome (a name on PATH or a "
@@ -4406,6 +4654,22 @@ def build_parser():
                     help="list: rows to show (default 50); subscribe: stop after N seconds "
                          "(0 = until Ctrl-C)")
     sp.set_defaults(fn=cmd_buffer)
+
+    sp = sub.add_parser("hook", parents=[jsonopt],
+                        help="run JS before any page script (stealth patches / API hooks); "
+                             "resident across tabs with --daemon")
+    sp.add_argument("action", nargs="?", choices=["add", "stealth", "list", "remove", "clear"],
+                    metavar="{add,stealth,list,remove,clear}",
+                    help="stealth (anti-fingerprint bundle) | add | list | remove ID | clear; "
+                         "default list")
+    target_arg(sp)
+    sp.add_argument("--source", metavar="JS", help="add: inline script source")
+    sp.add_argument("--file", metavar="PATH", help="add: read the script from a file")
+    sp.add_argument("--wrap", metavar="NAME",
+                    help=f"add: a built-in recipe that logs calls via console "
+                         f"({', '.join(WRAP_RECIPES)})")
+    sp.add_argument("--id", metavar="ID", help="name this hook (remove ID; default auto)")
+    sp.set_defaults(fn=cmd_hook)
 
     sp = sub.add_parser("client", parents=[jsonopt],
                         help="install the fast Go front-end (installs as `chromectl`, daemon-backed)")

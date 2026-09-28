@@ -100,6 +100,31 @@ which clones the user's entire real Chrome profile.
 `perf URL` (Core Web Vitals), `lighthouse URL --preset desktop` (needs
 `npm i -g lighthouse`), `seo --json`, `a11y --json`.
 
+## Looking less like automation (`--stealth` + `hook`)
+
+Sites read automation/headless tells and change behaviour, which skews testing.
+
+- `start --stealth` — launch flags only: `navigator.webdriver` off, no infobar, a real
+  window size. Leaves the User-Agent honest (`HeadlessChrome` token stays).
+- `hook stealth` — the JS layer, run before any page script in every frame. Guarded to
+  only patch what's actually wrong (rewrites a software WebGL renderer, corrects the
+  800×600 headless `screen`, forces `navigator.webdriver` off only if it reads `true`,
+  fills legacy-headless gaps like `window.chrome`/plugins only when missing) and masks
+  patched natives so they still report `[native code]`.
+- `hook add --file p.js` / `--wrap fetch` — register your own before-page-scripts JS, or
+  a recipe that logs API calls (tail with `console`). `hook list` / `hook remove ID` / `hook clear`.
+
+Two homes, because the script rides a CDP connection:
+
+- **`--daemon` (resident):** `chromectl --daemon hook stealth` — re-applied to every
+  current and future tab (needs `daemon start`). A tab opened with a URL is reloaded once
+  so its first load is covered too.
+- **inside `run` (per-tab):** register on a tab you have, then navigate —
+  `run --step 'open about:blank' --step 'hook stealth' --step 'goto URL'`. A one-shot `hook`
+  outside a run is ephemeral (it warns).
+
+Defeats common fingerprint checks, not a determined adversary — CDP has side-channels.
+
 ## Electron apps (Slack, Discord, VS Code, Obsidian, …)
 
 An Electron app is Chromium, so everything above works against it once it is

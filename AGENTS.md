@@ -76,6 +76,54 @@ chromectl -i work run --step 'open https://site/login' \
 Add `--json` to the `run` itself (not to the steps) to get every step's result back
 as one array — see below.
 
+## Looking less like automation (`--stealth` + `hook`)
+
+Sites read a handful of signals to tell they're talking to an automated/headless
+browser and change behaviour accordingly, which skews testing. Two layers address it:
+
+```bash
+chromectl start --name real --stealth        # launch flags: navigator.webdriver off,
+                                              # no infobar, real window size (not 800x600)
+chromectl --daemon hook stealth               # the JS layer, resident across every tab
+```
+
+`start --stealth` sets launch flags only (`--disable-blink-features=AutomationControlled`,
+a real `--window-size`). It leaves the User-Agent **honest** — the `HeadlessChrome`
+token stays (and `navigator.userAgentData` is already clean). `hook stealth` adds the
+JS layer, a script that runs **before any page script, in every frame**. It follows two
+rules learned from probing real Chrome: **only patch what is actually wrong** (each fix
+is guarded — modern Chrome already ships real plugins/`window.chrome`/languages, so those
+are left alone rather than replaced with a detectable fake), and **keep patched natives
+looking native** (a `toString` mask, so an overridden `getParameter` still reports
+`[native code]`). Concretely it rewrites the SwiftShader WebGL renderer to a plausible
+GPU (only when software rendering is detected), corrects the 800×600 headless `screen`
+to match the window, forces `navigator.webdriver` off only if it actually reads `true`,
+and fills the legacy-headless gaps (`window.chrome`, plugins, languages, the
+`permissions.query` mismatch) only when present.
+
+`hook` is that primitive for general use too — register arbitrary JS, or a built-in
+recipe that logs API calls (tail them with `chromectl console`):
+
+```bash
+chromectl --daemon hook add --file patch.js   # your own before-page-scripts hook
+chromectl --daemon hook add --wrap fetch       # log every fetch() call to the console
+chromectl --daemon hook list                   # what's registered; hook remove ID / hook clear
+```
+
+There are two homes, because `addScriptToEvaluateOnNewDocument` lives on the CDP
+connection:
+
+- **`--daemon` (resident):** kept in a registry and re-applied to every current and
+  future tab via browser-level auto-attach — survives navigations and new tabs.
+  Needs `chromectl daemon start`.
+- **inside `run` (per-tab, no daemon):** applied to one tab for the life of the run.
+  Because it only affects a tab's *next* document, register it on a tab you already
+  have, then navigate — `run --step 'open about:blank' --step 'hook stealth' --step 'goto URL'`.
+  A one-shot `hook` outside a run is ephemeral (it warns).
+
+This defeats common fingerprint checks, not a determined adversary — CDP attachment
+itself still has side-channels.
+
 ## Conventions (apply everywhere)
 
 - **instance**: `-i NAME` / `--port N` selects which browser. `chromectl instances` lists them. Profiles persist per name.
@@ -278,7 +326,7 @@ Release downloads are verified against the SHA256SUMS.
 | command | usage | what |
 |---|---|---|
 | `list (ls)` | `--json` | list open targets (tabs) |
-| `start` | `FLAG... --json --port PORT --host HOST --name NAME --auto-port --profile PROFILE --ephemeral --headful --binary BINARY --app PATH --wait SECONDS --copy-profile --from-profile PATH --proxy URL --proxy-auth USER:PASS --proxy-bypass LIST --proxy-pac URL --chrome-arg FLAG` | launch a browser (headless by default) or any Electron app |
+| `start` | `FLAG... --json --port PORT --host HOST --name NAME --auto-port --profile PROFILE --ephemeral --headful --stealth --binary BINARY --app PATH --wait SECONDS --copy-profile --from-profile PATH --proxy URL --proxy-auth USER:PASS --proxy-bypass LIST --proxy-pac URL --chrome-arg FLAG` | launch a browser (headless by default) or any Electron app |
 | `instances (ps)` | `--json --prune` | list managed Chrome instances and their status |
 | `adopt` | `[PORT] --json --name NAME --force` | record an already-running browser/app on a debug port so -i NAME works |
 | `stop` | `[which] --json --all --purge --forget --force` | stop a managed instance (by name/port) or --all |
@@ -331,4 +379,5 @@ Release downloads are verified against the SHA256SUMS.
 | `replay` | `[target] --json --burp FILE --curl FILE --har FILE --last N --index INDEX --scheme {http,https} --method METHOD --url URL --set-header 'Name: value' --remove-header NAME --body BODY --body-file FILE --as SESSION.json --vs SESSION.json --diff --engine {auto,raw,fetch} --attach TARGET --timeout TIMEOUT --out FILE --bodycap BODYCAP` | re-send a captured/imported request (Burp/curl/HAR), tampered, through the live session or out-of-band |
 | `daemon` | `[{start,stop,status}] --json --foreground` | run a resident process holding warm CDP connections |
 | `buffer` | `[{start,stop,list,subscribe}] [target] --json --maxlen MAXLEN --backlog BACKLOG --max MAX` | daemon-resident tap on live network traffic: start/stop/list, subscribe to a live stream, feed replay --last (needs --daemon) |
+| `hook` | `[{add,stealth,list,remove,clear}] [target] --json --source JS --file PATH --wrap NAME --id ID` | run JS before any page script (stealth patches / API hooks); resident across tabs with --daemon |
 | `client` | `[{install,status,uninstall}] --json --from PATH --build` | install the fast Go front-end (installs as `chromectl`, daemon-backed) |

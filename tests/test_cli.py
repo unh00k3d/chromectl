@@ -352,6 +352,76 @@ def test_run_needs_steps(jcli):
     assert rc == 1 and got["error"]["kind"] == "bad-args"
 
 
+# --- stealth / hooks ------------------------------------------------------
+def test_hook_stealth_in_a_run_patches_fingerprints(jcli, server):
+    """hook stealth registered on a tab, then a navigation, hides the headless tells.
+    Expressions are single tokens on purpose so `run` injects the current tab as
+    the eval target (a spaced expression would be read as `target expr...`).
+
+    We assert on signals the bundle actually changes on a plain (non-`--stealth`)
+    headless: the 800x600 screen is corrected, and patched natives still look native.
+    webdriver is deliberately left at its authentic `false`, so it is not the probe."""
+    got, rc = jcli("run",
+                   "--step", "open about:blank",
+                   "--step", "hook stealth",
+                   "--step", f"goto {server}/index.html",
+                   "--step", "eval screen.width>=1920",
+                   "--step", "eval navigator.webdriver!==true",
+                   "--step", "eval typeof(window.chrome)",
+                   "--step", "eval /native/.test(Function.prototype.toString.toString())",
+                   timeout=120)
+    assert rc == 0, got
+    r = got["results"]
+    assert r[1]["result"]["kind"] == "stealth" and r[1]["result"]["ephemeral"] is False
+    assert r[3]["result"] is True, "screen should be corrected off the 800x600 default"
+    assert r[4]["result"] is True, "navigator.webdriver must not read true"
+    assert r[5]["result"] == "object", "window.chrome should be present"
+    assert r[6]["result"] is True, "Function.prototype.toString mask should look native"
+
+
+def test_hook_one_shot_outside_a_run_is_flagged_ephemeral(jcli, page):
+    with page("/index.html") as tid:
+        got, rc = jcli("hook", "stealth", tid)
+        assert rc == 0 and got["ok"]
+        assert got["ephemeral"] is True, "a one-shot hook can't persist past its connection"
+
+
+def test_hook_daemon_covers_a_tab_opened_after_registration(chrome, state_env, server, tmp_path):
+    """The daemon-resident path re-applies via browser-level auto-attach, so a tab
+    opened AFTER `hook stealth` is still patched — the thing a per-run hook can't do."""
+    if not any(shutil.which(b) for b in CHROME_BINARIES):
+        pytest.skip("no Chrome/Chromium on PATH")
+    env = dict(state_env, HOME=str(tmp_path))     # isolate the daemon's socket/state
+
+    def cx(*args, timeout=60):
+        cmd = [sys.executable, "-m", "chromectl", "--port", str(chrome)] + [str(x) for x in args]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+
+    def jcx(*args, **kw):
+        p = cx(*args, "--json", **kw)
+        return json.loads(p.stdout), p.returncode
+
+    try:
+        assert cx("daemon", "start").returncode == 0
+        reg, rc = jcx("--daemon", "hook", "stealth")
+        assert rc == 0 and reg["ok"], reg
+        opened, rc = jcx("--daemon", "open", f"{server}/index.html")
+        assert rc == 0, opened
+        tid = opened["id"]
+        w, rc = jcx("--daemon", "wait", tid, "--selector", "h1", "--timeout", "8000")
+        assert rc == 0, w
+        # the tab was created at a URL, so the daemon reloads it once to apply the
+        # hook; the corrected screen size proves the bundle ran on this tab.
+        sw, rc = jcx("--daemon", "eval", tid, "screen.width>=1920")
+        assert rc == 0 and sw is True, sw
+        lst, rc = jcx("--daemon", "hook", "list")
+        assert any(h["id"] == "stealth" for h in lst["hooks"]), lst
+        cleared, rc = jcx("--daemon", "hook", "clear")
+        assert rc == 0 and cleared["removed"] >= 1
+    finally:
+        cx("daemon", "stop")
+
+
 # --- audits ---------------------------------------------------------------
 def test_seo_audit(jcli, page):
     with page("/index.html") as tid:
