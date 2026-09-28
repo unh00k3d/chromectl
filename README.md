@@ -296,6 +296,41 @@ the **CDP connection** and revert when it closes. Since each `chromectl` command
 acts, and disconnects, use `--shot` to capture in the same session, or `--hold` to keep
 the connection open (Ctrl-C to release) so the override persists while you do other work.
 
+### Looking less like automation (`--stealth` + `hook`)
+Sites read a handful of signals to tell they're driving an automated/headless
+browser and change behaviour, which skews testing. Two layers address it, both built
+on `Page.addScriptToEvaluateOnNewDocument` (a script that runs **before any page
+script**, in every frame):
+
+```console
+$ chromectl start --name real --stealth      # launch flags: navigator.webdriver off,
+                                              # no infobar, a real window size
+$ chromectl --daemon hook stealth            # the JS layer, resident across every tab
+```
+
+`--stealth` sets launch flags only and leaves the **User-Agent honest** (the
+`HeadlessChrome` token stays). `hook stealth` adds the JS layer, and follows two rules
+learned from probing real Chrome: **only patch what is actually wrong** — modern Chrome
+already ships real plugins, `window.chrome` and languages, so those are left alone rather
+than replaced with a detectable fake — and **keep patched natives looking native** (a
+`toString` mask, so an overridden `getParameter` still reports `[native code]`). It
+rewrites a software (SwiftShader) WebGL renderer, corrects the 800×600 headless `screen`
+to match the window, and forces `navigator.webdriver` off only if it actually reads `true`.
+
+`hook` is the general primitive too — `hook add --file p.js`, or `hook add --wrap fetch`
+to log every `fetch()` call to the console; `hook list` / `hook remove ID` / `hook clear`.
+It has two homes because the script rides a CDP connection:
+
+- **`--daemon` (resident):** re-applied to every current and future tab via browser-level
+  auto-attach (needs `chromectl daemon start`); a tab opened at a URL is reloaded once so
+  its first load is covered.
+- **inside `run` (per-tab):** register on a tab you have, then navigate —
+  `run --step 'open about:blank' --step 'hook stealth' --step 'goto URL'`. A one-shot
+  `hook` outside a run is ephemeral (it warns).
+
+This defeats common fingerprint checks, not a determined adversary — CDP attachment
+itself still has side-channels.
+
 ### Interaction (Tier 2) — how it works
 `snapshot`/`click`/`fill`/`hover` use **Playwright attached to your Chrome over CDP**
 (`connect_over_cdp`) — no separate browser is launched. You get Playwright's
